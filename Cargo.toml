@@ -3,7 +3,7 @@ members = [
     "crates/core",
     "crates/axum",
     "crates/cli",
-    "crates/redis",
+    "crates/jobrail-redis",
     "crates/worker",
     "examples/api",
 ]

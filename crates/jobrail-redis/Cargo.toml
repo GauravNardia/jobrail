@@ -1,8 +1,8 @@
 [package]
-name = "cli"
+name = "jobrail-redis"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-jobrail-redis = { path = "../jobrail-redis" }
+redis = { version = "1.7.0", features = ["connection-manager", "tokio-comp"] }
 tokio = { version = "1.53.1", features = ["full"] }
