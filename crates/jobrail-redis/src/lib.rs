@@ -79,4 +79,44 @@ impl RedisStorage {
             None => Ok(None),
         }
     }
+
+    pub async fn claim_job(&mut self) -> redis::RedisResult<Option<Job>> {
+        let job_id: Option<String> = self.connection.lpop("jobrail:queue:waiting", None).await?;
+
+        let Some(job_id) = job_id else {
+            return Ok(None);
+        };
+
+        let job_uuid = job_id.parse::<uuid::Uuid>().map_err(|err| {
+            redis::RedisError::from((
+                redis::ErrorKind::UnexpectedReturnType,
+                "invalid job id in waiting queue",
+                err.to_string(),
+            ))
+        })?;
+
+        let job_id = jobrail_core::job::JobId(job_uuid);
+
+        let Some(mut job) = self.get_job(job_id).await? else {
+            return Ok(None);
+        };
+
+        job.transition_to(jobrail_core::job::JobState::Active)
+            .map_err(|err| {
+                redis::RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "invalid job state transition",
+                    format!("{:?} -> {:?}", err.from, err.to),
+                ))
+            })?;
+
+        self.save_job(&job).await?;
+
+        let _: () = self
+            .connection
+            .rpush("jobrail:queue:active", job.id.0.to_string())
+            .await?;
+
+        Ok(Some(job))
+    }
 }
