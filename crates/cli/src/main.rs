@@ -1,5 +1,6 @@
 use jobrail_core::job::Job;
 use jobrail_redis::RedisStorage;
+use jobrail_worker::Worker;
 
 #[tokio::main]
 async fn main() {
@@ -28,13 +29,9 @@ async fn main() {
 
     println!("Job enqueued");
 
-    let dequeued_job_id = storage
-        .dequeue()
-        .await
-        .expect("Failed to dequeue job")
-        .expect("Waiting queue was empty");
+    let mut worker = Worker::new().await.expect("Failed to create worker");
 
-    println!("Dequeued job: {}", dequeued_job_id.0);
+    worker.run_once().await.expect("Worker failed");
 
     let loaded_job = storage
         .get_job(job.id)
