@@ -1,15 +1,82 @@
+use jobrail_core::job::{Job, JobId};
 use redis::AsyncCommands;
 
-pub async fn test_connection() -> redis::RedisResult<()> {
-    let client = redis::Client::open("redis://127.0.0.1/")?;
+pub struct RedisStorage {
+    connection: redis::aio::MultiplexedConnection,
+}
 
-    let mut connection = client.get_multiplexed_async_connection().await?;
+impl RedisStorage {
+    pub async fn new() -> redis::RedisResult<Self> {
+        let client = redis::Client::open("redis://127.0.0.1/")?;
+        let connection = client.get_multiplexed_async_connection().await?;
 
-    let _: () = connection.set("jobrail:test", "hello").await?;
+        Ok(Self { connection })
+    }
 
-    let value: String = connection.get("jobrail:test").await?;
+    pub async fn save_job(&mut self, job: &Job) -> redis::RedisResult<()> {
+        let key = format!("jobrail:job:{}", job.id.0);
 
-    println!("Redis returned: {}", value);
+        let value = serde_json::to_string(job).map_err(|err| {
+            redis::RedisError::from((
+                redis::ErrorKind::UnexpectedReturnType,
+                "failed to serialize job",
+                err.to_string(),
+            ))
+        })?;
 
-    Ok(())
+        let _: () = self.connection.set(key, value).await?;
+
+        Ok(())
+    }
+
+    pub async fn get_job(
+        &mut self,
+        job_id: jobrail_core::job::JobId,
+    ) -> redis::RedisResult<Option<Job>> {
+        let key = format!("jobrail:job:{}", job_id.0);
+        let value: Option<String> = self.connection.get(key).await?;
+
+        match value {
+            Some(data) => {
+                let job = serde_json::from_str(&data).map_err(|err| {
+                    redis::RedisError::from((
+                        redis::ErrorKind::UnexpectedReturnType,
+                        "failed to deserialize job",
+                        err.to_string(),
+                    ))
+                })?;
+
+                Ok(Some(job))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn enqueue(&mut self, job_id: JobId) -> redis::RedisResult<()> {
+        let _: () = self
+            .connection
+            .rpush("jobrail:queue:waiting", job_id.0.to_string())
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn dequeue(&mut self) -> redis::RedisResult<Option<JobId>> {
+        let job_id: Option<String> = self.connection.lpop("jobrail:queue:waiting", None).await?;
+
+        match job_id {
+            Some(job_id) => {
+                let job_id = job_id.parse::<uuid::Uuid>().map_err(|err| {
+                    redis::RedisError::from((
+                        redis::ErrorKind::UnexpectedReturnType,
+                        "invalid job id in waiting queue",
+                        err.to_string(),
+                    ))
+                })?;
+
+                Ok(Some(JobId(job_id)))
+            }
+            None => Ok(None),
+        }
+    }
 }
