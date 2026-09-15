@@ -1,8 +1,11 @@
 [package]
-name = "cli"
+name = "jobrail-cli"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+jobrail-core = { path = "../core" }
 jobrail-redis = { path = "../jobrail-redis" }
+serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["full"] }
+uuid = "1.26.1"
