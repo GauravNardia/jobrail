@@ -1,6 +1,16 @@
 use jobrail_core::job::Job;
 use jobrail_redis::RedisStorage;
-use jobrail_worker::Worker;
+use jobrail_worker::{JobHandler, Worker};
+
+struct SendEmailHandler;
+
+impl JobHandler for SendEmailHandler {
+    fn execute(&self, payload: serde_json::Value) -> Result<(), String> {
+        println!("Sending email with payload: {payload}");
+
+        Ok(())
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -31,7 +41,9 @@ async fn main() {
 
     let mut worker = Worker::new().await.expect("Failed to create worker");
 
-    worker.run_once().await.expect("Worker failed");
+    let handler = SendEmailHandler;
+
+    worker.run_once(&handler).await.expect("Worker failed");
 
     let loaded_job = storage
         .get_job(job.id)

@@ -1,5 +1,10 @@
 use jobrail_core::job::JobState;
 use jobrail_redis::RedisStorage;
+use serde_json::Value;
+
+pub trait JobHandler: Send + Sync {
+    fn execute(&self, payload: Value) -> Result<(), String>;
+}
 
 pub struct Worker {
     storage: RedisStorage,
@@ -11,7 +16,10 @@ impl Worker {
         Ok(Self { storage })
     }
 
-    pub async fn run_once(&mut self) -> redis::RedisResult<()> {
+    pub async fn run_once<H>(&mut self, handler: &H) -> redis::RedisResult<()>
+    where
+        H: JobHandler,
+    {
         let Some(job_id) = self.storage.claim_job().await? else {
             println!("No jobs available");
 
@@ -35,6 +43,32 @@ impl Worker {
                 format!("{:?} -> {:?}", err.from, err.to),
             ))
         })?;
+
+        match handler.execute(job.payload.clone()) {
+            Ok(()) => {
+                println!("Job executed successfully");
+
+                job.transition_to(JobState::Completed).map_err(|err| {
+                    redis::RedisError::from((
+                        redis::ErrorKind::UnexpectedReturnType,
+                        "invalid job state transition",
+                        format!("{:?} -> {:?}", err.from, err.to),
+                    ))
+                })?
+            }
+
+            Err(error) => {
+                println!("Job execution failed: {error}");
+
+                job.transition_to(JobState::Failed).map_err(|err| {
+                    redis::RedisError::from((
+                        redis::ErrorKind::UnexpectedReturnType,
+                        "invalid job state transition",
+                        format!("{:?} -> {:?}", err.from, err.to),
+                    ))
+                })?;
+            }
+        }
 
         self.storage.save_job(&job).await?;
 
