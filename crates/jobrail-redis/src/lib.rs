@@ -149,9 +149,13 @@ impl RedisStorage {
 
         let now_ms = now.as_millis() as u64;
 
-        let job_ids: Vec<String> = self
-            .connection
-            .zrangebyscore("jobrail:queue:delayed", 0, now_ms)
+        let script = Script::new(include_str!("scripts/promote_delayed_jobs.lua"));
+
+        let job_ids: Vec<String> = script
+            .key("jobrail:queue:delayed")
+            .key("jobrail:queue:waiting")
+            .arg(now_ms)
+            .invoke_async(&mut self.connection)
             .await?;
 
         for job_id in job_ids {
@@ -181,17 +185,7 @@ impl RedisStorage {
 
             self.save_job(&job).await?;
 
-            let _: () = self
-                .connection
-                .zrem("jobrail:queue:delayed", job_id.0.to_string())
-                .await?;
-
-            let _: () = self
-                .connection
-                .rpush("jobrail:queue:waiting", job_id.0.to_string())
-                .await?;
-
-            println!("Promoted delayed job: {}", job_id.0);
+            println!("Promoted delayed job: {}", job.id.0);
         }
 
         Ok(())
