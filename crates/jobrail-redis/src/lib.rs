@@ -135,4 +135,39 @@ impl RedisStorage {
 
         Ok(())
     }
+
+    pub async fn promote_delayed_jobs(&mut self) -> redis::RedisResult<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| {
+                redis::RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "system clock is before UNIX epoch",
+                    err.to_string(),
+                ))
+            })?;
+
+        let now_ms = now.as_millis() as u64;
+
+        let job_ids: Vec<String> = self
+            .connection
+            .zrangebyscore("jobrail:queue:delayed", 0, now_ms)
+            .await?;
+
+        for job_id in job_ids {
+            let _: () = self
+                .connection
+                .zrem("jobrail:queue:delayed", &job_id)
+                .await?;
+
+            let _: () = self
+                .connection
+                .rpush("jobrail:queue:waiting", &job_id)
+                .await?;
+
+            println!("Promoted delayed job: {job_id}");
+        }
+
+        Ok(())
+    }
 }
