@@ -155,17 +155,43 @@ impl RedisStorage {
             .await?;
 
         for job_id in job_ids {
+            let uuid = job_id.parse::<uuid::Uuid>().map_err(|err| {
+                redis::RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "invalid job id in delayed queue",
+                    err.to_string(),
+                ))
+            })?;
+
+            let job_id = JobId(uuid);
+
+            let Some(mut job) = self.get_job(job_id.clone()).await? else {
+                println!("Delayed job was not found: {:?}", job_id);
+                continue;
+            };
+
+            job.transition_to(jobrail_core::job::JobState::Waiting)
+                .map_err(|err| {
+                    redis::RedisError::from((
+                        redis::ErrorKind::UnexpectedReturnType,
+                        "invalid delayed job state transition",
+                        format!("{:?} -> {:?}", err.from, err.to),
+                    ))
+                })?;
+
+            self.save_job(&job).await?;
+
             let _: () = self
                 .connection
-                .zrem("jobrail:queue:delayed", &job_id)
+                .zrem("jobrail:queue:delayed", job_id.0.to_string())
                 .await?;
 
             let _: () = self
                 .connection
-                .rpush("jobrail:queue:waiting", &job_id)
+                .rpush("jobrail:queue:waiting", job_id.0.to_string())
                 .await?;
 
-            println!("Promoted delayed job: {job_id}");
+            println!("Promoted delayed job: {}", job_id.0);
         }
 
         Ok(())
