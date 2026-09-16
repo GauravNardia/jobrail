@@ -1,5 +1,6 @@
 use jobrail_core::job::{Job, JobId};
 use redis::{AsyncCommands, Script};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct RedisStorage {
     connection: redis::aio::MultiplexedConnection,
@@ -103,5 +104,35 @@ impl RedisStorage {
             }
             None => Ok(None),
         }
+    }
+
+    pub async fn schedule_retry(&mut self, job_id: JobId, delay_ms: u64) -> redis::RedisResult<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| {
+                redis::RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "system clock is before UNIX epoch",
+                    err.to_string(),
+                ))
+            })?;
+
+        let retry_at = now.as_millis() as u64 + delay_ms;
+
+        let _: () = self
+            .connection
+            .zadd("jobrail:queue:delayed", job_id.0.to_string(), retry_at)
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn remove_from_active(&mut self, job_id: JobId) -> redis::RedisResult<()> {
+        let _: () = self
+            .connection
+            .lrem("jobrail:queue:active", 0, job_id.0.to_string())
+            .await?;
+
+        Ok(())
     }
 }

@@ -8,7 +8,7 @@ impl JobHandler for SendEmailHandler {
     fn execute(&self, payload: serde_json::Value) -> Result<(), String> {
         println!("Sending email with payload: {payload}");
 
-        Ok(())
+        Err("Email service failed".to_string())
     }
 }
 

@@ -36,6 +36,9 @@ impl Worker {
 
         println!("Job state before: {:?}", job.state);
 
+        job.attempts_started += 1;
+        job.attempts_made += 1;
+
         job.transition_to(JobState::Active).map_err(|err| {
             redis::RedisError::from((
                 redis::ErrorKind::UnexpectedReturnType,
@@ -60,13 +63,36 @@ impl Worker {
             Err(error) => {
                 println!("Job execution failed: {error}");
 
-                job.transition_to(JobState::Failed).map_err(|err| {
-                    redis::RedisError::from((
-                        redis::ErrorKind::UnexpectedReturnType,
-                        "invalid job state transition",
-                        format!("{:?} -> {:?}", err.from, err.to),
-                    ))
-                })?;
+                if job.attempts_made >= job.max_attempts {
+                    println!("Maximum attempts reached");
+
+                    job.transition_to(JobState::Failed).map_err(|err| {
+                        redis::RedisError::from((
+                            redis::ErrorKind::UnexpectedReturnType,
+                            "invalid job state transition",
+                            format!("{:?} -> {:?}", err.from, err.to),
+                        ))
+                    })?;
+                } else {
+                    println!(
+                        "Retrying job. Attempt {}/{}",
+                        job.attempts_made, job.max_attempts
+                    );
+
+                    job.transition_to(JobState::Delayed).map_err(|err| {
+                        redis::RedisError::from((
+                            redis::ErrorKind::UnexpectedReturnType,
+                            "invalid job state transition",
+                            format!("{:?} -> {:?}", err.from, err.to),
+                        ))
+                    })?;
+
+                    // schedule for retry and add to delayed ZSET
+                    self.storage.schedule_retry(job.id.clone(), 5_000).await?;
+
+                    // remove from active state
+                    self.storage.remove_from_active(job.id.clone()).await?;
+                }
             }
         }
 
