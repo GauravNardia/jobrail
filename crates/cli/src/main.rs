@@ -61,7 +61,7 @@ async fn main() {
 
     println!("Waiting 6 seconds for retry time...");
 
-    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     storage
         .promote_delayed_jobs()
@@ -77,7 +77,7 @@ async fn main() {
 
     println!("Waiting 6 seconds for second retry...");
 
-    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
     storage
         .promote_delayed_jobs()

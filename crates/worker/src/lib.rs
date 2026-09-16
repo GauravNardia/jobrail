@@ -16,6 +16,19 @@ impl Worker {
         Ok(Self { storage })
     }
 
+    pub async fn run<H>(&mut self, handler: &H) -> redis::RedisResult<()>
+    where
+        H: JobHandler,
+    {
+        loop {
+            self.storage.promote_delayed_jobs().await?;
+
+            self.run_once(handler).await?;
+
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
     pub async fn run_once<H>(&mut self, handler: &H) -> redis::RedisResult<()>
     where
         H: JobHandler,
@@ -87,8 +100,12 @@ impl Worker {
                         ))
                     })?;
 
+                    let delay_ms = job.retry_delay_ms();
+                    println!("Retrying in {} ms", delay_ms);
                     // schedule for retry and add to delayed ZSET
-                    self.storage.schedule_retry(job.id.clone(), 5_000).await?;
+                    self.storage
+                        .schedule_retry(job.id.clone(), delay_ms)
+                        .await?;
 
                     // remove from active state
                     self.storage.remove_from_active(job.id.clone()).await?;

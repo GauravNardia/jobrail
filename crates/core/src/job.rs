@@ -90,6 +90,12 @@ impl Job {
 
         Ok(())
     }
+
+    pub fn retry_delay_ms(&self) -> u64 {
+        let base_delay = 1000_u64;
+
+        base_delay * 2_u64.pow(self.attempts_made.saturating_sub(1))
+    }
 }
 
 #[cfg(test)]
@@ -165,5 +171,22 @@ mod tests {
         let job = Job::new("send_email", serde_json::json!({}), options);
 
         assert_eq!(job.state, JobState::Delayed);
+    }
+
+    #[test]
+    fn retry_delay_uses_exponential_backoff() {
+        let mut job = Job::new("send_email", serde_json::json!({}), JobOptions::default());
+
+        job.attempts_made = 1;
+        assert_eq!(job.retry_delay_ms(), 1_000);
+
+        job.attempts_made = 2;
+        assert_eq!(job.retry_delay_ms(), 2_000);
+
+        job.attempts_made = 3;
+        assert_eq!(job.retry_delay_ms(), 4_000);
+
+        job.attempts_made = 4;
+        assert_eq!(job.retry_delay_ms(), 8_000);
     }
 }
