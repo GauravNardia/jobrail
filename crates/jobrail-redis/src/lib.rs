@@ -10,7 +10,12 @@ pub struct RedisStorage {
 impl RedisStorage {
     pub async fn new() -> redis::RedisResult<Self> {
         let client = redis::Client::open("redis://127.0.0.1/")?;
-        let connection = client.get_multiplexed_async_connection().await?;
+
+        let config = redis::AsyncConnectionConfig::new().set_response_timeout(None);
+
+        let connection = client
+            .get_multiplexed_async_connection_with_config(&config)
+            .await?;
 
         Ok(Self { connection })
     }
@@ -57,7 +62,7 @@ impl RedisStorage {
     pub async fn enqueue(&mut self, job_id: JobId) -> redis::RedisResult<()> {
         let _: () = self
             .connection
-            .rpush("jobrail:queue:waiting", job_id.0.to_string())
+            .lpush("jobrail:queue:waiting", job_id.0.to_string())
             .await?;
 
         Ok(())
@@ -190,5 +195,26 @@ impl RedisStorage {
         }
 
         Ok(())
+    }
+
+    pub async fn wait_and_claim_job(&mut self) -> redis::RedisResult<JobId> {
+        let job_id: String = redis::cmd("BLMOVE")
+            .arg("jobrail:queue:waiting")
+            .arg("jobrail:queue:active")
+            .arg("RIGHT")
+            .arg("LEFT")
+            .arg(0)
+            .query_async(&mut self.connection)
+            .await?;
+
+        let uuid = job_id.parse::<uuid::Uuid>().map_err(|err| {
+            redis::RedisError::from((
+                redis::ErrorKind::UnexpectedReturnType,
+                "invalid job id returned by BLMOVE",
+                err.to_string(),
+            ))
+        })?;
+
+        Ok(JobId(uuid))
     }
 }

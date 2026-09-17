@@ -9,7 +9,6 @@ pub trait JobHandler: Send + Sync {
 
 #[derive(Clone)]
 pub struct Worker {
-    storage: RedisStorage,
     concurrency: usize,
 }
 
@@ -22,12 +21,7 @@ impl Worker {
             )));
         }
 
-        let storage = RedisStorage::new().await?;
-
-        Ok(Self {
-            storage,
-            concurrency,
-        })
+        Ok(Self { concurrency })
     }
 
     pub async fn run<H>(&self, handler: Arc<H>) -> redis::RedisResult<()>
@@ -39,25 +33,26 @@ impl Worker {
         let mut handles = Vec::new();
 
         for worker_id in 1..=self.concurrency {
-            let worker = self.clone();
             let handler = Arc::clone(&handler);
 
             let handle = tokio::spawn(async move {
                 println!("Worker {worker_id} started");
 
+                let mut storage = match RedisStorage::new().await {
+                    Ok(storage) => storage,
+                    Err(error) => {
+                        eprintln!("Worker {worker_id} failed to connect to Redis: {error}");
+                        return;
+                    }
+                };
+
                 loop {
-                    match worker.run_once(worker_id, Arc::clone(&handler)).await {
-                        Ok(true) => {}
+                    if let Err(error) =
+                        Worker::run_once(worker_id, &mut storage, Arc::clone(&handler)).await
+                    {
+                        eprintln!("Worker {worker_id} failed: {error}");
 
-                        Ok(false) => {
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        }
-
-                        Err(error) => {
-                            eprintln!("Worker {worker_id} failed: {error}");
-
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
                 }
             });
@@ -66,23 +61,27 @@ impl Worker {
         }
 
         for handle in handles {
-            if let Err(error) = handle.await {
-                eprintln!("Worker task stopped: {error}");
-            }
+            handle.await.map_err(|error| {
+                redis::RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "worker task stopped",
+                    error.to_string(),
+                ))
+            })?;
         }
 
         Ok(())
     }
 
-    async fn run_once<H>(&self, worker_id: usize, handler: Arc<H>) -> redis::RedisResult<bool>
+    async fn run_once<H>(
+        worker_id: usize,
+        storage: &mut RedisStorage,
+        handler: Arc<H>,
+    ) -> redis::RedisResult<()>
     where
         H: JobHandler + 'static,
     {
-        let mut storage = self.storage.clone();
-
-        let Some(job_id) = storage.claim_job().await? else {
-            return Ok(false);
-        };
+        let job_id = storage.wait_and_claim_job().await?;
 
         println!("Worker {worker_id} claimed job: {}", job_id.0);
 
@@ -91,7 +90,7 @@ impl Worker {
 
             storage.remove_from_active(job_id).await?;
 
-            return Ok(true);
+            return Ok(());
         };
 
         println!("Worker {worker_id}: job state before: {:?}", job.state);
@@ -181,6 +180,6 @@ impl Worker {
 
         println!("Worker {worker_id}: job state after: {:?}", job.state);
 
-        Ok(true)
+        Ok(())
     }
 }
