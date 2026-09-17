@@ -81,7 +81,7 @@ impl Worker {
     where
         H: JobHandler + 'static,
     {
-        // Claim the job and receive ownership token.
+        // Claim the job and receive an ownership token.
         let lease = storage.wait_and_claim_job(30_000).await?;
 
         println!("Worker {worker_id} claimed job: {}", lease.job_id.0);
@@ -114,6 +114,7 @@ impl Worker {
 
                     Err(error) => {
                         eprintln!("Failed to renew job lease: {error}");
+
                         break;
                     }
                 }
@@ -124,6 +125,7 @@ impl Worker {
             println!("Worker {worker_id}: job was not found: {}", lease.job_id.0);
 
             storage.remove_from_active(lease.job_id.clone()).await?;
+
             storage
                 .remove_from_processing(lease.job_id.clone(), lease.token.clone())
                 .await?;
@@ -168,15 +170,30 @@ impl Worker {
             Ok(()) => {
                 println!("Worker {worker_id}: job executed successfully");
 
-                job.transition_to(JobState::Completed).map_err(|err| {
-                    redis::RedisError::from((
-                        redis::ErrorKind::UnexpectedReturnType,
-                        "invalid job state transition",
-                        format!("{:?} -> {:?}", err.from, err.to),
-                    ))
-                })?;
+                // Completion is now ownership-protected.
+                //
+                // Redis checks that this worker still owns:
+                //
+                //     job_id:token
+                //
+                // before marking the job Completed.
+                let completed = storage
+                    .complete_job(job.id.clone(), lease.token.clone())
+                    .await?;
 
-                storage.remove_from_active(job.id.clone()).await?;
+                if completed {
+                    job.state = JobState::Completed;
+
+                    println!("Worker {worker_id}: job completed successfully");
+                } else {
+                    // The lease expired or another worker owns
+                    // the job now. We MUST NOT save our local
+                    // job state because we are no longer the owner.
+                    eprintln!(
+                        "Worker {worker_id}: lost ownership of job {} before completion",
+                        job.id.0
+                    );
+                }
             }
 
             Err(error) => {
@@ -185,46 +202,64 @@ impl Worker {
                 if job.attempts_made >= job.max_attempts {
                     println!("Worker {worker_id}: maximum attempts reached");
 
-                    job.transition_to(JobState::Failed).map_err(|err| {
-                        redis::RedisError::from((
-                            redis::ErrorKind::UnexpectedReturnType,
-                            "invalid job state transition",
-                            format!("{:?} -> {:?}", err.from, err.to),
-                        ))
-                    })?;
+                    let failed = storage
+                        .fail_job(job.id.clone(), lease.token.clone(), JobState::Failed, 0)
+                        .await?;
 
-                    storage.remove_from_active(job.id.clone()).await?;
+                    if failed {
+                        job.state = JobState::Failed;
+
+                        println!("Worker {worker_id}: job marked as Failed");
+                    } else {
+                        eprintln!(
+                            "Worker {worker_id}: lost ownership of job {} before marking it Failed",
+                            job.id.0
+                        );
+                    }
                 } else {
                     println!(
                         "Worker {worker_id}: retrying job. Attempt {}/{}",
                         job.attempts_made, job.max_attempts
                     );
 
-                    job.transition_to(JobState::Delayed).map_err(|err| {
-                        redis::RedisError::from((
-                            redis::ErrorKind::UnexpectedReturnType,
-                            "invalid job state transition",
-                            format!("{:?} -> {:?}", err.from, err.to),
-                        ))
-                    })?;
-
                     let delay_ms = job.retry_delay_ms();
+
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|err| {
+                            redis::RedisError::from((
+                                redis::ErrorKind::UnexpectedReturnType,
+                                "system clock is before UNIX epoch",
+                                err.to_string(),
+                            ))
+                        })?;
+
+                    let retry_at = now.as_millis() as u64 + delay_ms;
 
                     println!("Worker {worker_id}: retrying in {} ms", delay_ms);
 
-                    storage.schedule_retry(job.id.clone(), delay_ms).await?;
+                    let delayed = storage
+                        .fail_job(
+                            job.id.clone(),
+                            lease.token.clone(),
+                            JobState::Delayed,
+                            retry_at,
+                        )
+                        .await?;
 
-                    storage.remove_from_active(job.id.clone()).await?;
+                    if delayed {
+                        job.state = JobState::Delayed;
+
+                        println!("Worker {worker_id}: job scheduled for retry");
+                    } else {
+                        eprintln!(
+                            "Worker {worker_id}: lost ownership of job {} before scheduling retry",
+                            job.id.0
+                        );
+                    }
                 }
             }
         }
-
-        storage.save_job(&job).await?;
-
-        // Only remove the processing lease belonging to THIS worker.
-        storage
-            .remove_from_processing(job.id.clone(), lease.token.clone())
-            .await?;
 
         println!("Worker {worker_id}: job state after: {:?}", job.state);
 

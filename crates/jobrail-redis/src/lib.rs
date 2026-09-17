@@ -1,4 +1,4 @@
-use jobrail_core::job::{Job, JobId};
+use jobrail_core::job::{Job, JobId, JobState};
 use redis::{AsyncCommands, Script};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -334,5 +334,58 @@ impl RedisStorage {
             .await?;
 
         Ok(())
+    }
+
+    pub async fn complete_job(&mut self, job_id: JobId, token: String) -> redis::RedisResult<bool> {
+        let lease_member = format!("{}:{}", job_id.0, token);
+
+        let job_key = format!("jobrail:job:{}", job_id.0);
+
+        let script = Script::new(include_str!("scripts/complete_job.lua"));
+
+        let completed: i32 = script
+            .key("jobrail:queue:processing")
+            .key(job_key)
+            .key("jobrail:queue:active")
+            .arg(lease_member)
+            .invoke_async(&mut self.connection)
+            .await?;
+
+        Ok(completed == 1)
+    }
+
+    pub async fn fail_job(
+        &mut self,
+        job_id: JobId,
+        token: String,
+        state: JobState,
+        retry_at: u64,
+    ) -> redis::RedisResult<bool> {
+        let lease_member = format!("{}:{}", job_id.0, token);
+
+        let job_key = format!("jobrail:job:{}", job_id.0);
+
+        let state = serde_json::to_string(&state).map_err(|err| {
+            redis::RedisError::from((
+                redis::ErrorKind::UnexpectedReturnType,
+                "failed to serialize job state",
+                err.to_string(),
+            ))
+        })?;
+
+        let script = Script::new(include_str!("scripts/fail_job.lua"));
+
+        let result: i32 = script
+            .key("jobrail:queue:processing")
+            .key(job_key)
+            .key("jobrail:queue:active")
+            .key("jobrail:queue:delayed")
+            .arg(lease_member)
+            .arg(state.trim_matches('"'))
+            .arg(retry_at)
+            .invoke_async(&mut self.connection)
+            .await?;
+
+        Ok(result == 1)
     }
 }
