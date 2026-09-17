@@ -9,6 +9,8 @@ impl JobState {
             (JobState::Prioritized, JobState::Active) => true,
             // A delayed job becomes waiting once its delay expires.
             (JobState::Delayed, JobState::Waiting) => true,
+
+            (JobState::Active, JobState::Waiting) => true,
             // A running job can finish successfully.
             (JobState::Active, JobState::Completed) => true,
             // A running job can fail.
@@ -58,5 +60,10 @@ mod tests {
     #[test]
     fn failed_cannot_become_completed() {
         assert!(!JobState::Failed.can_transition_to(JobState::Completed));
+    }
+
+    #[test]
+    fn active_can_return_to_waiting_after_recovery() {
+        assert!(JobState::Active.can_transition_to(JobState::Waiting));
     }
 }

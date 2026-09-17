@@ -87,30 +87,32 @@ impl RedisStorage {
         }
     }
 
-    pub async fn claim_job(&mut self) -> redis::RedisResult<Option<JobId>> {
-        let script = Script::new(include_str!("scripts/claim_job.lua"));
+    //  Unused -> Will delete it later
 
-        let result: Option<String> = script
-            .key("jobrail:queue:waiting")
-            .key("jobrail:queue:active")
-            .invoke_async(&mut self.connection)
-            .await?;
+    // pub async fn claim_job(&mut self) -> redis::RedisResult<Option<JobId>> {
+    //     let script = Script::new(include_str!("scripts/claim_job.lua"));
 
-        match result {
-            Some(job_id) => {
-                let uuid = job_id.parse::<uuid::Uuid>().map_err(|err| {
-                    redis::RedisError::from((
-                        redis::ErrorKind::UnexpectedReturnType,
-                        "invalid job id returned by claim script",
-                        err.to_string(),
-                    ))
-                })?;
+    //     let result: Option<String> = script
+    //         .key("jobrail:queue:waiting")
+    //         .key("jobrail:queue:active")
+    //         .invoke_async(&mut self.connection)
+    //         .await?;
 
-                Ok(Some(JobId(uuid)))
-            }
-            None => Ok(None),
-        }
-    }
+    //     match result {
+    //         Some(job_id) => {
+    //             let uuid = job_id.parse::<uuid::Uuid>().map_err(|err| {
+    //                 redis::RedisError::from((
+    //                     redis::ErrorKind::UnexpectedReturnType,
+    //                     "invalid job id returned by claim script",
+    //                     err.to_string(),
+    //                 ))
+    //             })?;
+
+    //             Ok(Some(JobId(uuid)))
+    //         }
+    //         None => Ok(None),
+    //     }
+    // }
 
     pub async fn schedule_retry(&mut self, job_id: JobId, delay_ms: u64) -> redis::RedisResult<()> {
         let now = SystemTime::now()
@@ -197,7 +199,7 @@ impl RedisStorage {
         Ok(())
     }
 
-    pub async fn wait_and_claim_job(&mut self) -> redis::RedisResult<JobId> {
+    pub async fn wait_and_claim_job(&mut self, lease_ms: u64) -> redis::RedisResult<JobId> {
         let job_id: String = redis::cmd("BLMOVE")
             .arg("jobrail:queue:waiting")
             .arg("jobrail:queue:active")
@@ -215,6 +217,124 @@ impl RedisStorage {
             ))
         })?;
 
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| {
+                redis::RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "system clock is before UNIX epoch",
+                    err.to_string(),
+                ))
+            })?;
+
+        let lease_until = now.as_millis() as u64 + lease_ms;
+
+        let _: () = self
+            .connection
+            .zadd("jobrail:queue:processing", job_id, lease_until)
+            .await?;
+
         Ok(JobId(uuid))
+    }
+
+    pub async fn recover_expired_jobs(&mut self) -> redis::RedisResult<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| {
+                redis::RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "system clock is before UNIX epoch",
+                    err.to_string(),
+                ))
+            })?;
+
+        let now_ms = now.as_millis() as u64;
+
+        let job_ids: Vec<String> = self
+            .connection
+            .zrangebyscore("jobrail:queue:processing", 0, now_ms)
+            .await?;
+
+        for job_id in job_ids {
+            let uuid = job_id.parse::<uuid::Uuid>().map_err(|err| {
+                redis::RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "invalid job id in processing queue",
+                    err.to_string(),
+                ))
+            })?;
+
+            let job_id = JobId(uuid);
+
+            let Some(mut job) = self.get_job(job_id.clone()).await? else {
+                println!("Expired job was not found: {}", job_id.0);
+
+                let _: () = self
+                    .connection
+                    .zrem("jobrail:queue:processing", job_id.0.to_string())
+                    .await?;
+
+                continue;
+            };
+
+            job.transition_to(jobrail_core::job::JobState::Waiting)
+                .map_err(|err| {
+                    redis::RedisError::from((
+                        redis::ErrorKind::UnexpectedReturnType,
+                        "invalid expired job state transition",
+                        format!("{:?} -> {:?}", err.from, err.to),
+                    ))
+                })?;
+
+            self.save_job(&job).await?;
+
+            let _: () = self
+                .connection
+                .zrem("jobrail:queue:processing", job_id.0.to_string())
+                .await?;
+
+            let _: () = self
+                .connection
+                .lpush("jobrail:queue:waiting", job_id.0.to_string())
+                .await?;
+
+            println!("Recovered expired job: {}", job_id.0);
+        }
+
+        Ok(())
+    }
+
+    pub async fn renew_lease(&mut self, job_id: JobId, lease_ms: u64) -> redis::RedisResult<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| {
+                redis::RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "system clock is before UNIX epoch",
+                    err.to_string(),
+                ))
+            })?;
+
+        let lease_until = now.as_millis() as u64 + lease_ms;
+
+        let _: () = self
+            .connection
+            .zadd(
+                "jobrail:queue:processing",
+                job_id.0.to_string(),
+                lease_until,
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn remove_from_processing(&mut self, job_id: JobId) -> redis::RedisResult<()> {
+        let _: () = self
+            .connection
+            .zrem("jobrail:queue:processing", job_id.0.to_string())
+            .await?;
+
+        Ok(())
     }
 }

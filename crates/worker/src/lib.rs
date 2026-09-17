@@ -30,6 +30,26 @@ impl Worker {
     {
         println!("Starting worker pool with {} workers", self.concurrency);
 
+        // let recovery_handle = tokio::spawn(async {
+        //     let mut storage = match RedisStorage::new().await {
+        //         Ok(storage) => storage,
+        //         Err(error) => {
+        //             eprintln!("Recovery worker failed to connect to Redis: {error}");
+        //             return;
+        //         }
+        //     };
+
+        //     println!("Recovery worker started");
+
+        //     loop {
+        //         if let Err(error) = storage.recover_expired_jobs().await {
+        //             eprintln!("Recovery worker failed: {error}");
+        //         }
+
+        //         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        //     }
+        // });
+
         let mut handles = Vec::new();
 
         for worker_id in 1..=self.concurrency {
@@ -70,6 +90,8 @@ impl Worker {
             })?;
         }
 
+        // recovery_handle.abort();
+
         Ok(())
     }
 
@@ -81,14 +103,34 @@ impl Worker {
     where
         H: JobHandler + 'static,
     {
-        let job_id = storage.wait_and_claim_job().await?;
+        let job_id = storage.wait_and_claim_job(30_000).await?;
 
         println!("Worker {worker_id} claimed job: {}", job_id.0);
+
+        let heartbeat_job_id = job_id.clone();
+        let mut heartbeat_storage = storage.clone();
+
+        let heartbeat_handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+                if let Err(error) = heartbeat_storage
+                    .renew_lease(heartbeat_job_id.clone(), 30_000)
+                    .await
+                {
+                    eprintln!("Failed to renew job lease: {error}");
+                    break;
+                }
+
+                println!("Heartbeat: renewed lease for job {}", heartbeat_job_id.0);
+            }
+        });
 
         let Some(mut job) = storage.get_job(job_id.clone()).await? else {
             println!("Worker {worker_id}: job was not found: {}", job_id.0);
 
-            storage.remove_from_active(job_id).await?;
+            storage.remove_from_active(job_id.clone()).await?;
+            storage.remove_from_processing(job_id).await?;
 
             return Ok(());
         };
@@ -120,6 +162,8 @@ impl Worker {
                     err.to_string(),
                 ))
             })?;
+
+        heartbeat_handle.abort();
 
         match result {
             Ok(()) => {
@@ -178,8 +222,24 @@ impl Worker {
 
         storage.save_job(&job).await?;
 
+        storage.remove_from_processing(job.id.clone()).await?;
+
         println!("Worker {worker_id}: job state after: {:?}", job.state);
 
         Ok(())
+    }
+}
+
+pub async fn run_recovery() -> redis::RedisResult<()> {
+    let mut storage = RedisStorage::new().await?;
+
+    println!("Recovery worker started");
+
+    loop {
+        if let Err(error) = storage.recover_expired_jobs().await {
+            eprintln!("Recovery worker failed: {error}");
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }

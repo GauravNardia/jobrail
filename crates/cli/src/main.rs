@@ -9,7 +9,7 @@ impl JobHandler for SendEmailHandler {
     fn execute(&self, payload: serde_json::Value) -> Result<(), String> {
         println!("Starting job: {payload}");
 
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_secs(40));
 
         println!("Finished job: {payload}");
 
@@ -25,28 +25,25 @@ async fn main() {
 
     let handler = Arc::new(SendEmailHandler);
 
-    for i in 1..=5 {
-        let job = Job::new(
-            format!("test_job_{i}"),
-            serde_json::json!({
-                "job_number": i
-            }),
-            Default::default(),
-        );
+    let job = Job::new(
+        "test_job",
+        serde_json::json!({
+            "job_number": 1
+        }),
+        Default::default(),
+    );
 
-        println!("Created job: {}", job.id.0);
+    println!("Created job: {}", job.id.0);
 
-        storage.save_job(&job).await.expect("Failed to save job");
+    storage.save_job(&job).await.expect("Failed to save job");
 
-        storage
-            .enqueue(job.id)
-            .await
-            .expect("Failed to enqueue job");
-    }
+    storage
+        .enqueue(job.id)
+        .await
+        .expect("Failed to enqueue job");
 
-    println!("Created and enqueued 5 jobs");
+    println!("Created and enqueued 1 job");
 
-    // Maximum 3 jobs can execute at the same time.
     let worker = Worker::new(3).await.expect("Failed to create worker");
 
     worker.run(handler).await.expect("Worker failed");
