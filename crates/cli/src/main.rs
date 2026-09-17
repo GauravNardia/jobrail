@@ -1,26 +1,19 @@
-use std::sync::atomic::{AtomicU32, Ordering};
-
 use jobrail_core::job::Job;
 use jobrail_redis::RedisStorage;
 use jobrail_worker::{JobHandler, Worker};
+use std::sync::Arc;
 
-struct SendEmailHandler {
-    attempts: AtomicU32,
-}
+struct SendEmailHandler;
 
 impl JobHandler for SendEmailHandler {
     fn execute(&self, payload: serde_json::Value) -> Result<(), String> {
-        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        println!("Starting job: {payload}");
 
-        println!("Sending email with payload: {payload} (handler attempt {attempt})");
+        std::thread::sleep(std::time::Duration::from_secs(2));
 
-        if attempt < 3 {
-            Err("Email service failed".to_string())
-        } else {
-            println!("Email sent successfully!");
+        println!("Finished job: {payload}");
 
-            Ok(())
-        }
+        Ok(())
     }
 }
 
@@ -30,75 +23,31 @@ async fn main() {
         .await
         .expect("Failed to connect to Redis");
 
-    let job = Job::new(
-        "send_email",
-        serde_json::json!({
-            "email": "test@example.com"
-        }),
-        Default::default(),
-    );
+    let handler = Arc::new(SendEmailHandler);
 
-    println!("Created job: {}", job.id.0);
+    for i in 1..=5 {
+        let job = Job::new(
+            format!("test_job_{i}"),
+            serde_json::json!({
+                "job_number": i
+            }),
+            Default::default(),
+        );
 
-    storage.save_job(&job).await.expect("Failed to save job");
+        println!("Created job: {}", job.id.0);
 
-    println!("Job saved to Redis");
+        storage.save_job(&job).await.expect("Failed to save job");
 
-    storage
-        .enqueue(job.id.clone())
-        .await
-        .expect("Failed to enqueue job");
+        storage
+            .enqueue(job.id)
+            .await
+            .expect("Failed to enqueue job");
+    }
 
-    println!("Job enqueued");
+    println!("Created and enqueued 5 jobs");
 
-    let mut worker = Worker::new().await.expect("Failed to create worker");
+    // Maximum 3 jobs can execute at the same time.
+    let worker = Worker::new(3).await.expect("Failed to create worker");
 
-    let handler = SendEmailHandler {
-        attempts: AtomicU32::new(0),
-    };
-
-    worker.run_once(&handler).await.expect("Worker failed");
-
-    println!("Waiting 6 seconds for retry time...");
-
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-    storage
-        .promote_delayed_jobs()
-        .await
-        .expect("Failed to promote delayed jobs");
-
-    println!("Retrying job now...");
-
-    worker
-        .run_once(&handler)
-        .await
-        .expect("Retry worker failed");
-
-    println!("Waiting 6 seconds for second retry...");
-
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-    storage
-        .promote_delayed_jobs()
-        .await
-        .expect("Failed to promote delayed jobs");
-
-    println!("Running third attempt...");
-
-    worker
-        .run_once(&handler)
-        .await
-        .expect("Third attempt failed");
-
-    let loaded_job = storage
-        .get_job(job.id)
-        .await
-        .expect("Failed to get job")
-        .expect("Job was not found");
-
-    println!(
-        "Final job state: {:?}, attempts made: {}",
-        loaded_job.state, loaded_job.attempts_made
-    );
+    worker.run(handler).await.expect("Worker failed");
 }

@@ -1,53 +1,100 @@
 use jobrail_core::job::JobState;
 use jobrail_redis::RedisStorage;
 use serde_json::Value;
+use std::sync::Arc;
 
 pub trait JobHandler: Send + Sync {
     fn execute(&self, payload: Value) -> Result<(), String>;
 }
 
+#[derive(Clone)]
 pub struct Worker {
     storage: RedisStorage,
+    concurrency: usize,
 }
 
 impl Worker {
-    pub async fn new() -> redis::RedisResult<Self> {
-        let storage = RedisStorage::new().await?;
-        Ok(Self { storage })
-    }
-
-    pub async fn run<H>(&mut self, handler: &H) -> redis::RedisResult<()>
-    where
-        H: JobHandler,
-    {
-        loop {
-            self.storage.promote_delayed_jobs().await?;
-
-            self.run_once(handler).await?;
-
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    pub async fn new(concurrency: usize) -> redis::RedisResult<Self> {
+        if concurrency == 0 {
+            return Err(redis::RedisError::from((
+                redis::ErrorKind::InvalidClientConfig,
+                "worker concurrency must be greater than zero",
+            )));
         }
+
+        let storage = RedisStorage::new().await?;
+
+        Ok(Self {
+            storage,
+            concurrency,
+        })
     }
 
-    pub async fn run_once<H>(&mut self, handler: &H) -> redis::RedisResult<()>
+    pub async fn run<H>(&self, handler: Arc<H>) -> redis::RedisResult<()>
     where
-        H: JobHandler,
+        H: JobHandler + 'static,
     {
-        let Some(job_id) = self.storage.claim_job().await? else {
-            println!("No jobs available");
+        println!("Starting worker pool with {} workers", self.concurrency);
 
-            return Ok(());
+        let mut handles = Vec::new();
+
+        for worker_id in 1..=self.concurrency {
+            let worker = self.clone();
+            let handler = Arc::clone(&handler);
+
+            let handle = tokio::spawn(async move {
+                println!("Worker {worker_id} started");
+
+                loop {
+                    match worker.run_once(worker_id, Arc::clone(&handler)).await {
+                        Ok(true) => {}
+
+                        Ok(false) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+
+                        Err(error) => {
+                            eprintln!("Worker {worker_id} failed: {error}");
+
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            if let Err(error) = handle.await {
+                eprintln!("Worker task stopped: {error}");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn run_once<H>(&self, worker_id: usize, handler: Arc<H>) -> redis::RedisResult<bool>
+    where
+        H: JobHandler + 'static,
+    {
+        let mut storage = self.storage.clone();
+
+        let Some(job_id) = storage.claim_job().await? else {
+            return Ok(false);
         };
 
-        println!("Worker claimed job: {}", job_id.0);
+        println!("Worker {worker_id} claimed job: {}", job_id.0);
 
-        let Some(mut job) = self.storage.get_job(job_id.clone()).await? else {
-            println!("Job was not found: {}", job_id.0);
+        let Some(mut job) = storage.get_job(job_id.clone()).await? else {
+            println!("Worker {worker_id}: job was not found: {}", job_id.0);
 
-            return Ok(());
+            storage.remove_from_active(job_id).await?;
+
+            return Ok(true);
         };
 
-        println!("Job state before: {:?}", job.state);
+        println!("Worker {worker_id}: job state before: {:?}", job.state);
 
         job.attempts_started += 1;
         job.attempts_made += 1;
@@ -60,9 +107,24 @@ impl Worker {
             ))
         })?;
 
-        match handler.execute(job.payload.clone()) {
+        storage.save_job(&job).await?;
+
+        let payload = job.payload.clone();
+        let handler = Arc::clone(&handler);
+
+        let result = tokio::task::spawn_blocking(move || handler.execute(payload))
+            .await
+            .map_err(|err| {
+                redis::RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "job handler task panicked",
+                    err.to_string(),
+                ))
+            })?;
+
+        match result {
             Ok(()) => {
-                println!("Job executed successfully");
+                println!("Worker {worker_id}: job executed successfully");
 
                 job.transition_to(JobState::Completed).map_err(|err| {
                     redis::RedisError::from((
@@ -70,14 +132,16 @@ impl Worker {
                         "invalid job state transition",
                         format!("{:?} -> {:?}", err.from, err.to),
                     ))
-                })?
+                })?;
+
+                storage.remove_from_active(job.id.clone()).await?;
             }
 
             Err(error) => {
-                println!("Job execution failed: {error}");
+                println!("Worker {worker_id}: job execution failed: {error}");
 
                 if job.attempts_made >= job.max_attempts {
-                    println!("Maximum attempts reached");
+                    println!("Worker {worker_id}: maximum attempts reached");
 
                     job.transition_to(JobState::Failed).map_err(|err| {
                         redis::RedisError::from((
@@ -86,9 +150,11 @@ impl Worker {
                             format!("{:?} -> {:?}", err.from, err.to),
                         ))
                     })?;
+
+                    storage.remove_from_active(job.id.clone()).await?;
                 } else {
                     println!(
-                        "Retrying job. Attempt {}/{}",
+                        "Worker {worker_id}: retrying job. Attempt {}/{}",
                         job.attempts_made, job.max_attempts
                     );
 
@@ -101,22 +167,20 @@ impl Worker {
                     })?;
 
                     let delay_ms = job.retry_delay_ms();
-                    println!("Retrying in {} ms", delay_ms);
-                    // schedule for retry and add to delayed ZSET
-                    self.storage
-                        .schedule_retry(job.id.clone(), delay_ms)
-                        .await?;
 
-                    // remove from active state
-                    self.storage.remove_from_active(job.id.clone()).await?;
+                    println!("Worker {worker_id}: retrying in {} ms", delay_ms);
+
+                    storage.schedule_retry(job.id.clone(), delay_ms).await?;
+
+                    storage.remove_from_active(job.id.clone()).await?;
                 }
             }
         }
 
-        self.storage.save_job(&job).await?;
+        storage.save_job(&job).await?;
 
-        println!("Job state after: {:?}", job.state);
+        println!("Worker {worker_id}: job state after: {:?}", job.state);
 
-        Ok(())
+        Ok(true)
     }
 }

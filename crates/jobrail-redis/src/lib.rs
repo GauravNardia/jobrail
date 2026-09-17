@@ -2,6 +2,7 @@ use jobrail_core::job::{Job, JobId};
 use redis::{AsyncCommands, Script};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Clone)]
 pub struct RedisStorage {
     connection: redis::aio::MultiplexedConnection,
 }
