@@ -37,7 +37,7 @@ async fn same_idempotency_key_executes_only_once() {
     // Create worker
     // --------------------------------------------------
 
-    let worker = Worker::new(1).await.expect("failed to create worker");
+    // let worker = Worker::new(1).await.expect("failed to create worker");
 
     // --------------------------------------------------
     // Redis storage
