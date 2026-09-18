@@ -73,7 +73,7 @@ impl Worker {
         Ok(())
     }
 
-    async fn run_once<H>(
+    pub async fn run_once<H>(
         worker_id: usize,
         storage: &mut RedisStorage,
         handler: Arc<H>,
@@ -137,18 +137,101 @@ impl Worker {
 
         println!("Worker {worker_id}: job state before: {:?}", job.state);
 
+        let started = storage
+            .start_job(job.id.clone(), lease.token.clone())
+            .await?;
+
+        if !started {
+            println!(
+                "Worker {worker_id}: lost ownership of job {} before starting",
+                job.id.0
+            );
+
+            heartbeat_handle.abort();
+
+            return Ok(());
+        }
+
         job.attempts_started += 1;
         job.attempts_made += 1;
+        job.state = JobState::Active;
 
-        job.transition_to(JobState::Active).map_err(|err| {
-            redis::RedisError::from((
-                redis::ErrorKind::UnexpectedReturnType,
-                "invalid job state transition",
-                format!("{:?} -> {:?}", err.from, err.to),
-            ))
-        })?;
+        // Check idempotency before executing the handler.
+        if let Some(idempotency_key) = job.idempotency_key.clone() {
+            let idempotency_state = storage
+                .check_idempotency_key(idempotency_key.clone())
+                .await?;
 
-        storage.save_job(&job).await?;
+            match idempotency_state {
+                jobrail_redis::IdempotencyState::New => {
+                    let claimed = storage
+                        .claim_idempotency_key(idempotency_key, job.id.clone())
+                        .await?;
+
+                    if !claimed {
+                        println!(
+                            "Worker {worker_id}: idempotency key was claimed by another worker"
+                        );
+
+                        heartbeat_handle.abort();
+
+                        return Ok(());
+                    }
+
+                    println!("Worker {worker_id}: idempotency key reserved");
+                }
+
+                jobrail_redis::IdempotencyState::Processing => {
+                    println!(
+                        "Worker {worker_id}: idempotency key is already processing; skipping execution"
+                    );
+
+                    let returned_to_waiting = storage
+                        .fail_job(job.id.clone(), lease.token.clone(), JobState::Waiting, 0)
+                        .await?;
+
+                    heartbeat_handle.abort();
+
+                    if returned_to_waiting {
+                        job.state = JobState::Waiting;
+
+                        println!("Worker {worker_id}: duplicate job returned to Waiting");
+                    } else {
+                        eprintln!(
+                            "Worker {worker_id}: lost ownership of duplicate job {}",
+                            job.id.0
+                        );
+                    }
+
+                    return Ok(());
+                }
+
+                jobrail_redis::IdempotencyState::Completed => {
+                    println!(
+                        "Worker {worker_id}: idempotency key is already completed; skipping execution"
+                    );
+
+                    let completed = storage
+                        .complete_job(job.id.clone(), lease.token.clone())
+                        .await?;
+
+                    heartbeat_handle.abort();
+
+                    if completed {
+                        job.state = JobState::Completed;
+
+                        println!("Worker {worker_id}: duplicate job marked as Completed");
+                    } else {
+                        eprintln!(
+                            "Worker {worker_id}: lost ownership of duplicate job {}",
+                            job.id.0
+                        );
+                    }
+
+                    return Ok(());
+                }
+            }
+        }
 
         let payload = job.payload.clone();
         let handler = Arc::clone(&handler);
@@ -170,16 +253,23 @@ impl Worker {
             Ok(()) => {
                 println!("Worker {worker_id}: job executed successfully");
 
-                // Completion is now ownership-protected.
-                //
-                // Redis checks that this worker still owns:
-                //
-                //     job_id:token
-                //
-                // before marking the job Completed.
-                let completed = storage
-                    .complete_job(job.id.clone(), lease.token.clone())
-                    .await?;
+                let completed = match job.idempotency_key.clone() {
+                    Some(idempotency_key) => {
+                        storage
+                            .complete_job_with_idempotency(
+                                job.id.clone(),
+                                lease.token.clone(),
+                                idempotency_key,
+                            )
+                            .await?
+                    }
+
+                    None => {
+                        storage
+                            .complete_job(job.id.clone(), lease.token.clone())
+                            .await?
+                    }
+                };
 
                 if completed {
                     job.state = JobState::Completed;

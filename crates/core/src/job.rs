@@ -26,11 +26,12 @@ pub struct StateTransitionError {
     pub to: JobState,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct JobOptions {
     pub priority: i32,
     pub max_attempts: u32,
     pub delay_ms: u64,
+    pub idempotency_key: Option<String>,
 }
 
 impl Default for JobOptions {
@@ -39,6 +40,7 @@ impl Default for JobOptions {
             priority: 0,
             max_attempts: 3,
             delay_ms: 0,
+            idempotency_key: None,
         }
     }
 }
@@ -54,6 +56,7 @@ pub struct Job {
     pub attempts_started: u32,
     pub max_attempts: u32,
     pub delay_ms: u64,
+    pub idempotency_key: Option<String>,
 }
 
 impl Job {
@@ -76,6 +79,7 @@ impl Job {
             attempts_started: 0,
             max_attempts: options.max_attempts,
             delay_ms: options.delay_ms,
+            idempotency_key: options.idempotency_key,
         }
     }
 

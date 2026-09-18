@@ -1,11 +1,31 @@
 use jobrail_core::job::{Job, JobId, JobState};
 use redis::{AsyncCommands, Script};
+use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct JobLease {
     pub job_id: JobId,
     pub token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdempotencyRecord {
+    pub job_id: JobId,
+    pub status: IdempotencyStatus,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub enum IdempotencyStatus {
+    Processing,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdempotencyState {
+    New,
+    Processing,
+    Completed,
 }
 
 #[derive(Clone)]
@@ -336,6 +356,23 @@ impl RedisStorage {
         Ok(())
     }
 
+    pub async fn start_job(&mut self, job_id: JobId, token: String) -> redis::RedisResult<bool> {
+        let lease_member = format!("{}:{}", job_id.0, token);
+
+        let job_key = format!("jobrail:job:{}", job_id.0);
+
+        let script = Script::new(include_str!("scripts/start_job.lua"));
+
+        let result: i32 = script
+            .key("jobrail:queue:processing")
+            .key(job_key)
+            .arg(lease_member)
+            .invoke_async(&mut self.connection)
+            .await?;
+
+        Ok(result == 1)
+    }
+
     pub async fn complete_job(&mut self, job_id: JobId, token: String) -> redis::RedisResult<bool> {
         let lease_member = format!("{}:{}", job_id.0, token);
 
@@ -387,5 +424,116 @@ impl RedisStorage {
             .await?;
 
         Ok(result == 1)
+    }
+
+    pub async fn claim_idempotency_key(
+        &mut self,
+        idempotency_key: String,
+        job_id: JobId,
+    ) -> redis::RedisResult<bool> {
+        let redis_key = format!("jobrail:idempotency:{}", idempotency_key);
+
+        let script = Script::new(include_str!("scripts/claim_idempotency.lua"));
+
+        let claimed: i32 = script
+            .key(redis_key)
+            .arg(job_id.0.to_string())
+            .invoke_async(&mut self.connection)
+            .await?;
+
+        Ok(claimed == 1)
+    }
+
+    pub async fn complete_idempotency_key(
+        &mut self,
+        idempotency_key: String,
+        job_id: JobId,
+    ) -> redis::RedisResult<bool> {
+        let redis_key = format!("jobrail:idempotency:{}", idempotency_key);
+
+        let script = Script::new(include_str!("scripts/complete_idempotency.lua"));
+
+        let completed: i32 = script
+            .key(redis_key)
+            .arg(job_id.0.to_string())
+            .invoke_async(&mut self.connection)
+            .await?;
+
+        Ok(completed == 1)
+    }
+
+    pub async fn get_idempotency_key(
+        &mut self,
+        idempotency_key: String,
+    ) -> redis::RedisResult<Option<IdempotencyRecord>> {
+        let redis_key = format!("jobrail:idempotency:{}", idempotency_key);
+
+        let data: Option<String> = self.connection.get(redis_key).await?;
+
+        match data {
+            Some(data) => {
+                let record = serde_json::from_str::<IdempotencyRecord>(&data).map_err(|err| {
+                    redis::RedisError::from((
+                        redis::ErrorKind::UnexpectedReturnType,
+                        "failed to deserialize idempotency record",
+                        err.to_string(),
+                    ))
+                })?;
+
+                Ok(Some(record))
+            }
+
+            None => Ok(None),
+        }
+    }
+
+    pub async fn check_idempotency_key(
+        &mut self,
+        idempotency_key: String,
+    ) -> redis::RedisResult<IdempotencyState> {
+        let record = self.get_idempotency_key(idempotency_key).await?;
+
+        match record {
+            None => Ok(IdempotencyState::New),
+
+            Some(record) => match record.status {
+                IdempotencyStatus::Processing => Ok(IdempotencyState::Processing),
+
+                IdempotencyStatus::Completed => Ok(IdempotencyState::Completed),
+            },
+        }
+    }
+
+    pub async fn complete_job_with_idempotency(
+        &mut self,
+        job_id: JobId,
+        token: String,
+        idempotency_key: String,
+    ) -> redis::RedisResult<bool> {
+        let lease_member = format!("{}:{}", job_id.0, token);
+
+        let job_key = format!("jobrail:job:{}", job_id.0);
+
+        let idempotency_redis_key = format!("jobrail:idempotency:{}", idempotency_key);
+
+        let script = Script::new(include_str!("scripts/complete_job_with_idempotency.lua"));
+
+        let completed: i32 = script
+            // KEYS[1] = processing leases
+            .key("jobrail:queue:processing")
+            // KEYS[2] = job
+            .key(job_key)
+            // KEYS[3] = active queue
+            .key("jobrail:queue:active")
+            // KEYS[4] = idempotency record
+            .key(idempotency_redis_key)
+            // ARGV[1] = lease member
+            .arg(lease_member)
+            // ARGV[2] = idempotency key
+            .arg(idempotency_key)
+            .invoke_async(&mut self.connection)
+            .await?;
+
+        Ok(completed == 1)
     }
 }
