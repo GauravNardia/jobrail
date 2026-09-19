@@ -39,6 +39,7 @@ pub struct RepeatableJob {
     pub payload: serde_json::Value,
     pub schedule: RepeatSchedule,
     pub enabled: bool,
+    pub next_run_at: Option<u64>,
 }
 
 impl RepeatableJob {
@@ -53,6 +54,7 @@ impl RepeatableJob {
             payload,
             schedule,
             enabled: true,
+            next_run_at: None,
         }
     }
 }

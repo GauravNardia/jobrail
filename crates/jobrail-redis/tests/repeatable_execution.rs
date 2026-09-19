@@ -22,7 +22,8 @@ async fn repeatable_job_creates_scheduled_execution() {
     let job = storage
         .schedule_repeatable_execution(&repeatable_job, run_at)
         .await
-        .expect("failed to schedule repeatable execution");
+        .expect("failed to schedule repeatable execution")
+        .expect("scheduled execution was not created");
 
     assert_eq!(job.name, "send_report");
 

@@ -370,3 +370,82 @@ pub async fn run_recovery() -> redis::RedisResult<()> {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }
+
+pub async fn run_repeatable_scheduler() -> redis::RedisResult<()> {
+    let mut storage = RedisStorage::new().await?;
+
+    println!("Repeatable scheduler started");
+
+    loop {
+        match run_repeatable_scheduler_once(&mut storage).await {
+            Ok(created) => {
+                if created > 0 {
+                    println!("Created {} repeatable execution(s)", created);
+                }
+            }
+
+            Err(error) => {
+                eprintln!("Repeatable scheduler failed: {error}");
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+pub async fn run_repeatable_scheduler_once(
+    storage: &mut RedisStorage,
+) -> redis::RedisResult<usize> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| {
+            redis::RedisError::from((
+                redis::ErrorKind::UnexpectedReturnType,
+                "system clock is before UNIX epoch",
+                error.to_string(),
+            ))
+        })?
+        .as_millis() as u64;
+
+    let repeatable_job_ids = storage.get_due_repeatable_job_ids(now_ms).await?;
+
+    let mut created = 0;
+
+    for repeatable_job_id in repeatable_job_ids {
+        let id = uuid::Uuid::parse_str(&repeatable_job_id).map_err(|error| {
+            redis::RedisError::from((
+                redis::ErrorKind::UnexpectedReturnType,
+                "invalid repeatable job id",
+                error.to_string(),
+            ))
+        })?;
+
+        let repeatable_id = jobrail_core::repeat::RepeatableJobId(id);
+
+        let Some(repeatable_job) = storage.get_repeatable_job(repeatable_id).await? else {
+            continue;
+        };
+
+        if !repeatable_job.enabled {
+            continue;
+        }
+
+        let Some(run_at) = repeatable_job.next_run_at else {
+            continue;
+        };
+
+        if run_at > now_ms {
+            continue;
+        }
+
+        let result = storage
+            .create_repeatable_execution(&repeatable_job, run_at)
+            .await?;
+
+        if result.is_some() {
+            created += 1;
+        }
+    }
+
+    Ok(created)
+}

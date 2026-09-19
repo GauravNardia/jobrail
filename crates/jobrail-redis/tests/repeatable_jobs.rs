@@ -66,3 +66,37 @@ async fn repeatable_job_can_be_saved_and_loaded() {
         .await
         .expect("failed to clean test data");
 }
+
+#[tokio::test]
+#[serial]
+async fn repeatable_job_can_be_disabled() {
+    let mut storage = RedisStorage::new()
+        .await
+        .expect("failed to connect to Redis");
+
+    let job = RepeatableJob::new(
+        "send_report",
+        serde_json::json!({}),
+        RepeatSchedule::EveryMillis(60_000),
+    );
+
+    storage
+        .save_repeatable_job(job.clone())
+        .await
+        .expect("failed to save repeatable job");
+
+    let disabled = storage
+        .disable_repeatable_job(job.id)
+        .await
+        .expect("failed to disable repeatable job");
+
+    assert!(disabled);
+
+    let loaded = storage
+        .get_repeatable_job(job.id)
+        .await
+        .expect("failed to load repeatable job")
+        .expect("repeatable job missing");
+
+    assert!(!loaded.enabled);
+}
