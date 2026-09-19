@@ -48,7 +48,7 @@ impl Default for JobOptions {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     pub id: JobId,
     pub name: String,

@@ -1,4 +1,5 @@
 use jobrail_core::job::{Job, JobId, JobState};
+use jobrail_core::{job::JobOptions, repeat::RepeatableJob};
 use redis::{AsyncCommands, Script};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -605,5 +606,106 @@ impl RedisStorage {
                 })
             })
             .collect()
+    }
+    pub async fn save_repeatable_job(
+        &mut self,
+        repeatable_job: RepeatableJob,
+    ) -> redis::RedisResult<()> {
+        let job_id = repeatable_job.id.0.to_string();
+
+        let redis_key = format!("jobrail:repeat:{}", job_id);
+
+        let data = serde_json::to_string(&repeatable_job).map_err(|error| {
+            redis::RedisError::from((
+                redis::ErrorKind::UnexpectedReturnType,
+                "failed to serialize repeatable job",
+                error.to_string(),
+            ))
+        })?;
+
+        let _: () = self.connection.set(redis_key, data).await?;
+
+        let _: () = self
+            .connection
+            .sadd("jobrail:queue:repeatable", job_id)
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn get_repeatable_job(
+        &mut self,
+        id: jobrail_core::repeat::RepeatableJobId,
+    ) -> redis::RedisResult<Option<RepeatableJob>> {
+        let redis_key = format!("jobrail:repeat:{}", id.0);
+
+        let data: Option<String> = self.connection.get(redis_key).await?;
+
+        match data {
+            Some(data) => {
+                let job = serde_json::from_str::<RepeatableJob>(&data).map_err(|error| {
+                    redis::RedisError::from((
+                        redis::ErrorKind::UnexpectedReturnType,
+                        "failed to deserialize repeatable job",
+                        error.to_string(),
+                    ))
+                })?;
+
+                Ok(Some(job))
+            }
+
+            None => Ok(None),
+        }
+    }
+
+    pub async fn list_repeatable_jobs(&mut self) -> redis::RedisResult<Vec<RepeatableJob>> {
+        let ids: Vec<String> = self.connection.smembers("jobrail:queue:repeatable").await?;
+
+        let mut jobs = Vec::new();
+
+        for id in ids {
+            let Some(job) = self
+                .get_repeatable_job(jobrail_core::repeat::RepeatableJobId(
+                    uuid::Uuid::parse_str(&id).map_err(|error| {
+                        redis::RedisError::from((
+                            redis::ErrorKind::UnexpectedReturnType,
+                            "invalid repeatable job id",
+                            error.to_string(),
+                        ))
+                    })?,
+                ))
+                .await?
+            else {
+                continue;
+            };
+
+            jobs.push(job);
+        }
+
+        Ok(jobs)
+    }
+
+    pub async fn schedule_repeatable_execution(
+        &mut self,
+        repeatable_job: &RepeatableJob,
+        run_at: u64,
+    ) -> redis::RedisResult<Job> {
+        let options = JobOptions {
+            priority: 0,
+            max_attempts: 3,
+            delay_ms: 0,
+            run_at: Some(run_at),
+            idempotency_key: None,
+        };
+
+        let job = Job::new(
+            repeatable_job.name.clone(),
+            repeatable_job.payload.clone(),
+            options,
+        );
+
+        self.schedule_job(job.clone()).await?;
+
+        Ok(job)
     }
 }
