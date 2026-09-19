@@ -536,4 +536,74 @@ impl RedisStorage {
 
         Ok(completed == 1)
     }
+
+    pub async fn schedule_job(&mut self, job: Job) -> redis::RedisResult<()> {
+        let run_at = job.run_at.ok_or_else(|| {
+            redis::RedisError::from((
+                redis::ErrorKind::InvalidClientConfig,
+                "scheduled job requires run_at",
+            ))
+        })?;
+
+        let job_id = job.id.0.to_string();
+
+        let job_key = format!("jobrail:job:{}", job.id.0);
+
+        let job_data = serde_json::to_string(&job).map_err(|error| {
+            redis::RedisError::from((
+                redis::ErrorKind::UnexpectedReturnType,
+                "failed to serialize scheduled job",
+                error.to_string(),
+            ))
+        })?;
+
+        let script = Script::new(include_str!("scripts/schedule_job.lua"));
+
+        let _: i32 = script
+            .key(job_key)
+            .key("jobrail:queue:scheduled")
+            .arg(job_id)
+            .arg(job_data)
+            .arg(run_at)
+            .invoke_async(&mut self.connection)
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn promote_scheduled_jobs(&mut self) -> redis::RedisResult<Vec<JobId>> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| {
+                redis::RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "system clock is before UNIX epoch",
+                    error.to_string(),
+                ))
+            })?;
+
+        let now_ms = now.as_millis() as u64;
+
+        let script = Script::new(include_str!("scripts/promote_scheduled_jobs.lua"));
+
+        let job_ids: Vec<String> = script
+            .key("jobrail:queue:scheduled")
+            .key("jobrail:queue:waiting")
+            .arg(now_ms)
+            .invoke_async(&mut self.connection)
+            .await?;
+
+        job_ids
+            .into_iter()
+            .map(|id| {
+                uuid::Uuid::parse_str(&id).map(JobId).map_err(|error| {
+                    redis::RedisError::from((
+                        redis::ErrorKind::UnexpectedReturnType,
+                        "invalid scheduled job id",
+                        error.to_string(),
+                    ))
+                })
+            })
+            .collect()
+    }
 }

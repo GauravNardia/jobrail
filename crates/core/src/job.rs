@@ -14,6 +14,7 @@ impl JobId {
 pub enum JobState {
     Waiting,
     Prioritized,
+    Scheduled,
     Delayed,
     Active,
     Completed,
@@ -31,6 +32,7 @@ pub struct JobOptions {
     pub priority: i32,
     pub max_attempts: u32,
     pub delay_ms: u64,
+    pub run_at: Option<u64>,
     pub idempotency_key: Option<String>,
 }
 
@@ -40,6 +42,7 @@ impl Default for JobOptions {
             priority: 0,
             max_attempts: 3,
             delay_ms: 0,
+            run_at: None,
             idempotency_key: None,
         }
     }
@@ -56,12 +59,15 @@ pub struct Job {
     pub attempts_started: u32,
     pub max_attempts: u32,
     pub delay_ms: u64,
+    pub run_at: Option<u64>,
     pub idempotency_key: Option<String>,
 }
 
 impl Job {
     pub fn new(name: impl Into<String>, payload: serde_json::Value, options: JobOptions) -> Self {
-        let state = if options.delay_ms > 0 {
+        let state = if options.run_at.is_some() {
+            JobState::Scheduled
+        } else if options.delay_ms > 0 {
             JobState::Delayed
         } else if options.priority > 0 {
             JobState::Prioritized
@@ -79,6 +85,7 @@ impl Job {
             attempts_started: 0,
             max_attempts: options.max_attempts,
             delay_ms: options.delay_ms,
+            run_at: options.run_at,
             idempotency_key: options.idempotency_key,
         }
     }

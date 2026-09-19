@@ -3,20 +3,17 @@ use crate::job::JobState;
 impl JobState {
     pub fn can_transition_to(&self, next: JobState) -> bool {
         match (self, next) {
-            // job can enter normal waiting
             (JobState::Waiting, JobState::Active) => true,
-            // A prioritized job can become active.
             (JobState::Prioritized, JobState::Active) => true,
-            // A delayed job becomes waiting once its delay expires.
+
+            (JobState::Scheduled, JobState::Waiting) => true,
+
             (JobState::Delayed, JobState::Waiting) => true,
 
-            (JobState::Active, JobState::Waiting) => true,
-            // A running job can finish successfully.
             (JobState::Active, JobState::Completed) => true,
-            // A running job can fail.
             (JobState::Active, JobState::Failed) => true,
-            // A running job can be delayed.
             (JobState::Active, JobState::Delayed) => true,
+            (JobState::Active, JobState::Waiting) => true,
 
             _ => false,
         }
