@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "crates/core",
-    "crates/axum",
+    "crates/axum-api",
     "crates/cli",
     "crates/jobrail-redis",
     "crates/worker",
