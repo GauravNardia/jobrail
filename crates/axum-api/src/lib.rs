@@ -1,14 +1,18 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+pub mod dto;
+pub mod error;
+pub mod handlers;
+pub mod routes;
+pub mod state;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+use axum::Router;
+use jobrail_redis::RedisStorage;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+use crate::{routes::create_router, state::AppState};
+
+pub async fn create_app() -> Result<Router, redis::RedisError> {
+    let storage = RedisStorage::new().await?;
+
+    let state = AppState { storage };
+
+    Ok(create_router(state))
 }
