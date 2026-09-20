@@ -65,3 +65,17 @@ fn job_response(job: Job) -> JobResponse {
         attempts_started: job.attempts_started,
     }
 }
+
+pub async fn list_jobs(
+    State(mut state): State<AppState>,
+) -> Result<Json<Vec<JobResponse>>, ApiError> {
+    let jobs = state
+        .storage
+        .list_jobs()
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?;
+
+    let response = jobs.into_iter().map(job_response).collect();
+
+    Ok(Json(response))
+}

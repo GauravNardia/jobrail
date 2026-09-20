@@ -60,6 +60,23 @@ impl RedisStorage {
 
         let _: () = self.connection.set(key, value).await?;
 
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| {
+                redis::RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "system clock is before UNIX epoch",
+                    err.to_string(),
+                ))
+            })?;
+
+        let now_ms = now.as_millis() as i64;
+
+        let _: () = self
+            .connection
+            .zadd("jobrail:jobs:index", job.id.0.to_string(), now_ms)
+            .await?;
+
         Ok(())
     }
 
@@ -83,6 +100,33 @@ impl RedisStorage {
 
             None => Ok(None),
         }
+    }
+
+    pub async fn list_jobs(&mut self) -> redis::RedisResult<Vec<Job>> {
+        let job_ids: Vec<String> = self
+            .connection
+            .zrevrange("jobrail:jobs:index", 0, -1)
+            .await?;
+
+        let mut jobs = Vec::with_capacity(job_ids.len());
+
+        for job_id in job_ids {
+            let uuid = job_id.parse::<uuid::Uuid>().map_err(|err| {
+                redis::RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "invalid job id in job index",
+                    err.to_string(),
+                ))
+            })?;
+
+            let job_id = JobId(uuid);
+
+            if let Some(job) = self.get_job(job_id).await? {
+                jobs.push(job);
+            }
+        }
+
+        Ok(jobs)
     }
 
     pub async fn enqueue(&mut self, job_id: JobId) -> redis::RedisResult<()> {
