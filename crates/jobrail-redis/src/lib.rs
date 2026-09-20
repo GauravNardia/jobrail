@@ -115,44 +115,62 @@ impl RedisStorage {
     ) -> redis::RedisResult<JobPage> {
         let limit = limit.clamp(1, 100);
 
+        // Fetch one extra item so we can determine whether another page exists.
+        let fetch_limit = limit + 1;
+
         let entries: Vec<(String, f64)> = match cursor {
             None => {
                 redis::cmd("ZREVRANGE")
                     .arg("jobrail:jobs:index")
                     .arg(0)
-                    .arg(limit - 1)
+                    .arg(fetch_limit - 1)
                     .arg("WITHSCORES")
                     .query_async::<Vec<(String, f64)>>(&mut self.connection)
                     .await?
             }
 
             Some(cursor) => {
-                let (score, member) = decode_cursor(&cursor)?;
+                let (cursor_score, cursor_member) = decode_cursor(&cursor)?;
 
-                let mut entries: Vec<(String, f64)> = redis::cmd("ZREVRANGEBYLEX")
+                // Redis sorts members with the same score lexicographically.
+                // ZREVRANGE/ZREVRANGEBYSCORE therefore gives us:
+                //
+                // score DESC
+                // member DESC when scores are equal.
+                //
+                // First get all jobs having exactly the cursor score.
+                let mut same_score_members: Vec<String> = redis::cmd("ZRANGEBYSCORE")
                     .arg("jobrail:jobs:index")
-                    .arg(format!("({member}"))
-                    .arg("-")
-                    .arg("LIMIT")
-                    .arg(0)
-                    .arg(limit)
+                    .arg(cursor_score)
+                    .arg(cursor_score)
                     .query_async::<Vec<String>>(&mut self.connection)
-                    .await?
+                    .await?;
+
+                // ZRANGEBYSCORE returns same-score members in ascending
+                // lexicographical order. Reverse it to match ZREVRANGE order.
+                same_score_members.reverse();
+
+                // Only keep members AFTER the cursor.
+                same_score_members.retain(|member| member < &cursor_member);
+
+                let mut entries: Vec<(String, f64)> = same_score_members
                     .into_iter()
-                    .map(|member: String| (member, score))
+                    .take(fetch_limit)
+                    .map(|member| (member, cursor_score))
                     .collect();
 
-                if entries.len() < limit {
-                    let remaining = limit - entries.len();
+                // If we still need more jobs, get jobs with a LOWER score.
+                if entries.len() < fetch_limit {
+                    let remaining = fetch_limit - entries.len();
 
                     let lower_score_entries: Vec<(String, f64)> = redis::cmd("ZREVRANGEBYSCORE")
                         .arg("jobrail:jobs:index")
-                        .arg(format!("({score}"))
+                        .arg(format!("({cursor_score}"))
                         .arg("-inf")
+                        .arg("WITHSCORES")
                         .arg("LIMIT")
                         .arg(0)
                         .arg(remaining)
-                        .arg("WITHSCORES")
                         .query_async::<Vec<(String, f64)>>(&mut self.connection)
                         .await?;
 
@@ -162,6 +180,10 @@ impl RedisStorage {
                 entries
             }
         };
+
+        let has_more = entries.len() > limit;
+
+        let entries = entries.into_iter().take(limit).collect::<Vec<_>>();
 
         let mut jobs = Vec::with_capacity(entries.len());
 
@@ -181,14 +203,10 @@ impl RedisStorage {
             }
         }
 
-        let has_more = entries.len() == limit;
-
         let next_cursor = if has_more {
-            let (last_id, last_score) = entries
+            entries
                 .last()
-                .expect("entries cannot be empty when has_more is true");
-
-            Some(encode_cursor(*last_score, last_id))
+                .map(|(job_id, score)| encode_cursor(*score, job_id))
         } else {
             None
         };
