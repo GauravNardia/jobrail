@@ -3,6 +3,7 @@ local job_key = KEYS[2]
 local scheduled_queue = KEYS[3]
 local repeatable_key = KEYS[4]
 local repeatable_schedule = KEYS[5]
+local jobs_index = KEYS[6]
 
 local occurrence_exists = redis.call(
     "EXISTS",
@@ -47,6 +48,13 @@ redis.call(
 redis.call(
     "ZADD",
     scheduled_queue,
+    ARGV[3],
+    ARGV[1]
+)
+
+redis.call(
+    "ZADD",
+    jobs_index,
     ARGV[3],
     ARGV[1]
 )

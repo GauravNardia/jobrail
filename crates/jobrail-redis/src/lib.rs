@@ -46,9 +46,8 @@ impl RedisStorage {
 
         Ok(Self { connection })
     }
-
     pub async fn save_job(&mut self, job: &Job) -> redis::RedisResult<()> {
-        let key = format!("jobrail:job:{}", job.id.0);
+        let job_key = format!("jobrail:job:{}", job.id.0);
 
         let value = serde_json::to_string(job).map_err(|err| {
             redis::RedisError::from((
@@ -57,8 +56,6 @@ impl RedisStorage {
                 err.to_string(),
             ))
         })?;
-
-        let _: () = self.connection.set(key, value).await?;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -72,14 +69,16 @@ impl RedisStorage {
 
         let now_ms = now.as_millis() as i64;
 
-        let _: () = self
-            .connection
-            .zadd("jobrail:jobs:index", job.id.0.to_string(), now_ms)
-            .await?;
+        let mut pipe = redis::pipe();
+
+        pipe.atomic()
+            .set(job_key, value)
+            .zadd("jobrail:jobs:index", job.id.0.to_string(), now_ms);
+
+        let _: () = pipe.query_async(&mut self.connection).await?;
 
         Ok(())
     }
-
     pub async fn get_job(&mut self, job_id: JobId) -> redis::RedisResult<Option<Job>> {
         let key = format!("jobrail:job:{}", job_id.0);
 
@@ -605,17 +604,23 @@ impl RedisStorage {
         let script = Script::new(include_str!("scripts/schedule_job.lua"));
 
         let _: i32 = script
+            // KEYS[1]
             .key(job_key)
+            // KEYS[2]
             .key("jobrail:queue:scheduled")
+            // KEYS[3] ← ADD THIS
+            .key("jobrail:jobs:index")
+            // ARGV[1]
             .arg(job_id)
+            // ARGV[2]
             .arg(job_data)
+            // ARGV[3]
             .arg(run_at)
             .invoke_async(&mut self.connection)
             .await?;
 
         Ok(())
     }
-
     pub async fn promote_scheduled_jobs(&mut self) -> redis::RedisResult<Vec<JobId>> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -890,6 +895,7 @@ impl RedisStorage {
             .key("jobrail:queue:scheduled")
             .key(repeatable_key)
             .key("jobrail:queue:repeatable:schedule")
+            .key("jobrail:jobs:index")
             .arg(job.id.0.to_string())
             .arg(serde_json::to_string(&job).map_err(|error| {
                 redis::RedisError::from((
