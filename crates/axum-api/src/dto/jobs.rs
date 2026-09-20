@@ -23,6 +23,28 @@ pub struct CreateJobRequest {
     pub idempotency_key: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListJobsQuery {
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+fn default_limit() -> usize {
+    20
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobPageResponse {
+    pub jobs: Vec<JobResponse>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
 fn default_max_attempts() -> u32 {
     3
 }

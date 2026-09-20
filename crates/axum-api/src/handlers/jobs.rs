@@ -1,18 +1,18 @@
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
 };
 
 use jobrail_core::job::{Job, JobOptions};
 
 use crate::{
-    dto::jobs::{CreateJobRequest, JobResponse},
+    dto::jobs::{CreateJobRequest, JobPageResponse, JobResponse, ListJobsQuery},
     error::ApiError,
     state::AppState,
 };
 
 pub async fn create_job(
-    State(mut state): State<AppState>,
+    State(state): State<AppState>,
     Json(request): Json<CreateJobRequest>,
 ) -> Result<Json<JobResponse>, ApiError> {
     let options = JobOptions {
@@ -25,8 +25,9 @@ pub async fn create_job(
 
     let job = Job::new(request.name, request.payload, options);
 
-    state
-        .storage
+    let mut storage = state.storage.lock().await;
+
+    storage
         .save_job(&job)
         .await
         .map_err(|error| ApiError::Internal(error.to_string()))?;
@@ -35,7 +36,7 @@ pub async fn create_job(
 }
 
 pub async fn get_job(
-    State(mut state): State<AppState>,
+    State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<JobResponse>, ApiError> {
     let job_id = uuid::Uuid::parse_str(&id)
@@ -43,8 +44,9 @@ pub async fn get_job(
 
     let job_id = jobrail_core::job::JobId(job_id);
 
-    let job = state
-        .storage
+    let mut storage = state.storage.lock().await;
+
+    let job = storage
         .get_job(job_id)
         .await
         .map_err(|error| ApiError::Internal(error.to_string()))?;
@@ -67,15 +69,23 @@ fn job_response(job: Job) -> JobResponse {
 }
 
 pub async fn list_jobs(
-    State(mut state): State<AppState>,
-) -> Result<Json<Vec<JobResponse>>, ApiError> {
-    let jobs = state
-        .storage
-        .list_jobs()
+    State(state): State<AppState>,
+    Query(query): Query<ListJobsQuery>,
+) -> Result<Json<JobPageResponse>, ApiError> {
+    let mut storage = state.storage.lock().await;
+
+    let page = storage
+        .list_jobs(query.limit, query.cursor)
         .await
         .map_err(|error| ApiError::Internal(error.to_string()))?;
 
-    let response = jobs.into_iter().map(job_response).collect();
+    drop(storage);
 
-    Ok(Json(response))
+    let jobs = page.jobs.into_iter().map(job_response).collect();
+
+    Ok(Json(JobPageResponse {
+        jobs,
+        next_cursor: page.next_cursor,
+        has_more: page.has_more,
+    }))
 }

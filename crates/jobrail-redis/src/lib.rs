@@ -29,6 +29,13 @@ pub enum IdempotencyState {
     Completed,
 }
 
+#[derive(Debug, Clone)]
+pub struct JobPage {
+    pub jobs: Vec<Job>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
 #[derive(Clone)]
 pub struct RedisStorage {
     connection: redis::aio::MultiplexedConnection,
@@ -101,15 +108,64 @@ impl RedisStorage {
         }
     }
 
-    pub async fn list_jobs(&mut self) -> redis::RedisResult<Vec<Job>> {
-        let job_ids: Vec<String> = self
-            .connection
-            .zrevrange("jobrail:jobs:index", 0, -1)
-            .await?;
+    pub async fn list_jobs(
+        &mut self,
+        limit: usize,
+        cursor: Option<String>,
+    ) -> redis::RedisResult<JobPage> {
+        let limit = limit.clamp(1, 100);
 
-        let mut jobs = Vec::with_capacity(job_ids.len());
+        let entries: Vec<(String, f64)> = match cursor {
+            None => {
+                redis::cmd("ZREVRANGE")
+                    .arg("jobrail:jobs:index")
+                    .arg(0)
+                    .arg(limit - 1)
+                    .arg("WITHSCORES")
+                    .query_async::<Vec<(String, f64)>>(&mut self.connection)
+                    .await?
+            }
 
-        for job_id in job_ids {
+            Some(cursor) => {
+                let (score, member) = decode_cursor(&cursor)?;
+
+                let mut entries: Vec<(String, f64)> = redis::cmd("ZREVRANGEBYLEX")
+                    .arg("jobrail:jobs:index")
+                    .arg(format!("({member}"))
+                    .arg("-")
+                    .arg("LIMIT")
+                    .arg(0)
+                    .arg(limit)
+                    .query_async::<Vec<String>>(&mut self.connection)
+                    .await?
+                    .into_iter()
+                    .map(|member: String| (member, score))
+                    .collect();
+
+                if entries.len() < limit {
+                    let remaining = limit - entries.len();
+
+                    let lower_score_entries: Vec<(String, f64)> = redis::cmd("ZREVRANGEBYSCORE")
+                        .arg("jobrail:jobs:index")
+                        .arg(format!("({score}"))
+                        .arg("-inf")
+                        .arg("LIMIT")
+                        .arg(0)
+                        .arg(remaining)
+                        .arg("WITHSCORES")
+                        .query_async::<Vec<(String, f64)>>(&mut self.connection)
+                        .await?;
+
+                    entries.extend(lower_score_entries);
+                }
+
+                entries
+            }
+        };
+
+        let mut jobs = Vec::with_capacity(entries.len());
+
+        for (job_id, _) in &entries {
             let uuid = job_id.parse::<uuid::Uuid>().map_err(|err| {
                 redis::RedisError::from((
                     redis::ErrorKind::UnexpectedReturnType,
@@ -125,7 +181,23 @@ impl RedisStorage {
             }
         }
 
-        Ok(jobs)
+        let has_more = entries.len() == limit;
+
+        let next_cursor = if has_more {
+            let (last_id, last_score) = entries
+                .last()
+                .expect("entries cannot be empty when has_more is true");
+
+            Some(encode_cursor(*last_score, last_id))
+        } else {
+            None
+        };
+
+        Ok(JobPage {
+            jobs,
+            next_cursor,
+            has_more,
+        })
     }
 
     pub async fn enqueue(&mut self, job_id: JobId) -> redis::RedisResult<()> {
@@ -968,4 +1040,34 @@ impl RedisStorage {
 
         Ok(deleted == 1)
     }
+}
+
+fn encode_cursor(score: f64, member: &str) -> String {
+    format!("{score}:{member}")
+}
+
+fn decode_cursor(cursor: &str) -> redis::RedisResult<(f64, String)> {
+    let (score, member) = cursor.split_once(':').ok_or_else(|| {
+        redis::RedisError::from((
+            redis::ErrorKind::InvalidClientConfig,
+            "invalid pagination cursor",
+        ))
+    })?;
+
+    let score = score.parse::<f64>().map_err(|err| {
+        redis::RedisError::from((
+            redis::ErrorKind::InvalidClientConfig,
+            "invalid pagination cursor score",
+            err.to_string(),
+        ))
+    })?;
+
+    if member.is_empty() {
+        return Err(redis::RedisError::from((
+            redis::ErrorKind::InvalidClientConfig,
+            "invalid pagination cursor member",
+        )));
+    }
+
+    Ok((score, member.to_string()))
 }
