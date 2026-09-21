@@ -77,4 +77,5 @@ pub struct JobResponse {
     pub state: String,
     pub attempts_made: u32,
     pub attempts_started: u32,
+    pub run_at: Option<u64>,
 }

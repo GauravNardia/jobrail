@@ -476,6 +476,34 @@ pub async fn run_recovery() -> redis::RedisResult<()> {
     }
 }
 
+pub async fn run_scheduled_scheduler() -> redis::RedisResult<()> {
+    let mut storage = RedisStorage::new().await?;
+
+    println!("Scheduled job scheduler started");
+
+    loop {
+        match run_scheduled_scheduler_once(&mut storage).await {
+            Ok(promoted) => {
+                if promoted > 0 {
+                    println!("Promoted {} scheduled job(s)", promoted);
+                }
+            }
+
+            Err(error) => {
+                eprintln!("Scheduled job scheduler failed: {error}");
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+pub async fn run_scheduled_scheduler_once(storage: &mut RedisStorage) -> redis::RedisResult<usize> {
+    let promoted = storage.promote_scheduled_jobs().await?;
+
+    Ok(promoted.len())
+}
+
 // ------------------------------------------------------------
 // Repeatable job scheduler
 // ------------------------------------------------------------

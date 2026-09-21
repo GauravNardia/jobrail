@@ -18,6 +18,19 @@ pub async fn create_job(
     State(state): State<AppState>,
     Json(request): Json<CreateJobRequest>,
 ) -> Result<Json<JobResponse>, ApiError> {
+    if let Some(run_at) = request.run_at {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| ApiError::Internal(format!("failed to read system clock: {error}")))?
+            .as_millis() as u64;
+
+        if run_at <= now {
+            return Err(ApiError::BadRequest(
+                "runAt must be in the future".to_string(),
+            ));
+        }
+    }
+
     let options = JobOptions {
         priority: request.priority,
         max_attempts: request.max_attempts,
@@ -30,10 +43,22 @@ pub async fn create_job(
 
     let mut storage = state.storage.lock().await;
 
-    storage
-        .save_job(&job)
-        .await
-        .map_err(|error| ApiError::Internal(error.to_string()))?;
+    if job.run_at.is_some() {
+        storage
+            .schedule_job(job.clone())
+            .await
+            .map_err(|error| ApiError::Internal(error.to_string()))?;
+    } else {
+        storage
+            .save_job(&job)
+            .await
+            .map_err(|error| ApiError::Internal(error.to_string()))?;
+
+        storage
+            .enqueue(job.id.clone())
+            .await
+            .map_err(|error| ApiError::Internal(error.to_string()))?;
+    }
 
     Ok(Json(job_response(job)))
 }
@@ -68,6 +93,7 @@ fn job_response(job: Job) -> JobResponse {
         state: format!("{:?}", job.state),
         attempts_made: job.attempts_made,
         attempts_started: job.attempts_started,
+        run_at: job.run_at,
     }
 }
 

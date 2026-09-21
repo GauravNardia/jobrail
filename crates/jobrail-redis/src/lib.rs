@@ -749,17 +749,7 @@ impl RedisStorage {
         Ok(())
     }
     pub async fn promote_scheduled_jobs(&mut self) -> redis::RedisResult<Vec<JobId>> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| {
-                redis::RedisError::from((
-                    redis::ErrorKind::UnexpectedReturnType,
-                    "system clock is before UNIX epoch",
-                    error.to_string(),
-                ))
-            })?;
-
-        let now_ms = now.as_millis() as u64;
+        let now_ms = current_timestamp_ms();
 
         let script = Script::new(include_str!("scripts/promote_scheduled_jobs.lua"));
 
@@ -783,7 +773,6 @@ impl RedisStorage {
             })
             .collect()
     }
-
     pub async fn save_repeatable_job(
         &mut self,
         mut repeatable_job: RepeatableJob,
