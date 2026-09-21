@@ -21,7 +21,7 @@ pub fn create_router(state: AppState) -> Router {
                 .route("/jobs", post(create_job).get(list_jobs))
                 .route("/jobs/{id}", get(get_job))
                 .route("/jobs/{id}/cancel", post(cancel_job))
-                .route("jobs/{id}/retry", post(retry_job))
+                .route("/jobs/{id}/retry", post(retry_job))
                 .route("/jobs/{id}/attempts", get(get_job_attempts))
                 .route(
                     "/repeatable-jobs",

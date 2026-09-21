@@ -580,6 +580,10 @@ pub async fn run_repeatable_scheduler_once(
             .await?;
 
         if result.is_some() {
+            storage
+                .advance_repeatable_job(repeatable_job.id, run_at)
+                .await?;
+
             created += 1;
         }
     }
