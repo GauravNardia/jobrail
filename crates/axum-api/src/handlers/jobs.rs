@@ -6,7 +6,10 @@ use axum::{
 use jobrail_core::job::{Job, JobOptions};
 
 use crate::{
-    dto::jobs::{CreateJobRequest, JobPageResponse, JobResponse, ListJobsQuery},
+    dto::jobs::{
+        CreateJobRequest, JobAttemptResponse, JobAttemptsResponse, JobPageResponse, JobResponse,
+        ListJobsQuery,
+    },
     error::ApiError,
     state::AppState,
 };
@@ -75,7 +78,7 @@ pub async fn list_jobs(
     let mut storage = state.storage.lock().await;
 
     let page = storage
-        .list_jobs(query.limit, query.cursor)
+        .list_jobs(query.limit, query.cursor, query.state)
         .await
         .map_err(|error| ApiError::Internal(error.to_string()))?;
 
@@ -88,4 +91,89 @@ pub async fn list_jobs(
         next_cursor: page.next_cursor,
         has_more: page.has_more,
     }))
+}
+
+pub async fn cancel_job(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<JobResponse>, ApiError> {
+    let job_id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::BadRequest("invalid job id".to_string()))?;
+
+    let job_id = jobrail_core::job::JobId(job_id);
+
+    let mut storage = state.storage.lock().await;
+
+    let job = storage
+        .cancel_job(job_id)
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?;
+
+    let Some(job) = job else {
+        return Err(ApiError::NotFound("job not found".to_string()));
+    };
+
+    Ok(Json(job_response(job)))
+}
+
+pub async fn retry_job(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<JobResponse>, ApiError> {
+    let job_id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::BadRequest("invalid job id".to_string()))?;
+
+    let job_id = jobrail_core::job::JobId(job_id);
+
+    let mut storage = state.storage.lock().await;
+
+    let job = storage
+        .retry_job(job_id)
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?;
+
+    let Some(job) = job else {
+        return Err(ApiError::NotFound("job not found".to_string()));
+    };
+
+    Ok(Json(job_response(job)))
+}
+
+pub async fn get_job_attempts(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<JobAttemptsResponse>, ApiError> {
+    let job_id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::BadRequest("invalid job id".to_string()))?;
+
+    let job_id = jobrail_core::job::JobId(job_id);
+
+    let mut storage = state.storage.lock().await;
+
+    if storage
+        .get_job(job_id.clone())
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?
+        .is_none()
+    {
+        return Err(ApiError::NotFound("job not found".to_string()));
+    }
+
+    let attempts = storage
+        .get_job_attempts(job_id)
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?;
+
+    let attempts = attempts
+        .into_iter()
+        .map(|attempt| JobAttemptResponse {
+            attempt: attempt.attempt,
+            started_at: attempt.started_at,
+            finished_at: attempt.finished_at,
+            status: format!("{:?}", attempt.status),
+            error: attempt.error,
+        })
+        .collect();
+
+    Ok(Json(JobAttemptsResponse { attempts }))
 }

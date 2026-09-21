@@ -1,5 +1,22 @@
+use jobrail_core::job::JobState;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobAttemptResponse {
+    pub attempt: u32,
+    pub started_at: u64,
+    pub finished_at: Option<u64>,
+    pub status: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobAttemptsResponse {
+    pub attempts: Vec<JobAttemptResponse>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +48,9 @@ pub struct ListJobsQuery {
 
     #[serde(default)]
     pub cursor: Option<String>,
+
+    #[serde(default)]
+    pub state: Option<JobState>,
 }
 
 fn default_limit() -> usize {

@@ -10,6 +10,23 @@ impl JobId {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobAttempt {
+    pub attempt: u32,
+    pub started_at: u64,
+    pub finished_at: Option<u64>,
+    pub status: JobAttemptStatus,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum JobAttemptStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum JobState {
     Waiting,
@@ -19,6 +36,7 @@ pub enum JobState {
     Active,
     Completed,
     Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

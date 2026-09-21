@@ -15,6 +15,14 @@ impl JobState {
             (JobState::Active, JobState::Delayed) => true,
             (JobState::Active, JobState::Waiting) => true,
 
+            (JobState::Waiting, JobState::Cancelled) => true,
+            (JobState::Prioritized, JobState::Cancelled) => true,
+            (JobState::Delayed, JobState::Cancelled) => true,
+            (JobState::Scheduled, JobState::Cancelled) => true,
+            (JobState::Active, JobState::Cancelled) => true,
+
+            (JobState::Failed, JobState::Waiting) => true,
+
             _ => false,
         }
     }

@@ -1,4 +1,4 @@
-use jobrail_core::job::JobState;
+use jobrail_core::job::{JobAttempt, JobAttemptStatus, JobState};
 use jobrail_redis::RedisStorage;
 use serde_json::Value;
 use std::sync::Arc;
@@ -81,12 +81,18 @@ impl Worker {
     where
         H: JobHandler + 'static,
     {
-        // Claim the job and receive an ownership token.
+        // ------------------------------------------------------------
+        // 1. Claim a job and receive an ownership token.
+        // ------------------------------------------------------------
+
         let lease = storage.wait_and_claim_job(30_000).await?;
 
         println!("Worker {worker_id} claimed job: {}", lease.job_id.0);
 
-        // The heartbeat must use the SAME token that claimed the job.
+        // ------------------------------------------------------------
+        // 2. Start heartbeat using the SAME token that claimed the job.
+        // ------------------------------------------------------------
+
         let heartbeat_job_id = lease.job_id.clone();
         let heartbeat_token = lease.token.clone();
         let mut heartbeat_storage = storage.clone();
@@ -121,6 +127,10 @@ impl Worker {
             }
         });
 
+        // ------------------------------------------------------------
+        // 3. Load the job.
+        // ------------------------------------------------------------
+
         let Some(mut job) = storage.get_job(lease.job_id.clone()).await? else {
             println!("Worker {worker_id}: job was not found: {}", lease.job_id.0);
 
@@ -137,6 +147,10 @@ impl Worker {
 
         println!("Worker {worker_id}: job state before: {:?}", job.state);
 
+        // ------------------------------------------------------------
+        // 4. Atomically start the job.
+        // ------------------------------------------------------------
+
         let started = storage
             .start_job(job.id.clone(), lease.token.clone())
             .await?;
@@ -152,11 +166,13 @@ impl Worker {
             return Ok(());
         }
 
-        job.attempts_started += 1;
-        job.attempts_made += 1;
-        job.state = JobState::Active;
+        // ------------------------------------------------------------
+        // 5. Check idempotency BEFORE creating an attempt.
+        //
+        // A duplicate idempotency job does not actually execute the
+        // handler, so it should NOT create an attempt record.
+        // ------------------------------------------------------------
 
-        // Check idempotency before executing the handler.
         if let Some(idempotency_key) = job.idempotency_key.clone() {
             let idempotency_state = storage
                 .check_idempotency_key(idempotency_key.clone())
@@ -233,6 +249,37 @@ impl Worker {
             }
         }
 
+        // ------------------------------------------------------------
+        // 6. THIS IS A REAL EXECUTION.
+        //
+        // Now create the attempt.
+        // ------------------------------------------------------------
+
+        job.attempts_started += 1;
+        job.attempts_made += 1;
+        job.state = JobState::Active;
+
+        let attempt_number = job.attempts_started;
+
+        let attempt = JobAttempt {
+            attempt: attempt_number,
+            started_at: current_timestamp_ms(),
+            finished_at: None,
+            status: JobAttemptStatus::Running,
+            error: None,
+        };
+
+        storage.start_job_attempt(job.id.clone(), &attempt).await?;
+
+        println!(
+            "Worker {worker_id}: started attempt {} for job {}",
+            attempt_number, job.id.0
+        );
+
+        // ------------------------------------------------------------
+        // 7. Execute the actual handler.
+        // ------------------------------------------------------------
+
         let payload = job.payload.clone();
         let handler = Arc::clone(&handler);
 
@@ -246,13 +293,37 @@ impl Worker {
                 ))
             })?;
 
-        // Job execution finished, so heartbeat is no longer needed.
+        // ------------------------------------------------------------
+        // 8. Job execution finished.
+        // Heartbeat is no longer needed.
+        // ------------------------------------------------------------
+
         heartbeat_handle.abort();
+
+        // ------------------------------------------------------------
+        // 9. Handle success / failure.
+        // ------------------------------------------------------------
 
         match result {
             Ok(()) => {
                 println!("Worker {worker_id}: job executed successfully");
 
+                // Mark the SAME attempt as completed.
+                storage
+                    .finish_job_attempt(
+                        job.id.clone(),
+                        attempt_number,
+                        JobAttemptStatus::Completed,
+                        None,
+                    )
+                    .await?;
+
+                println!(
+                    "Worker {worker_id}: attempt {} marked Completed",
+                    attempt_number
+                );
+
+                // Now complete the actual job.
                 let completed = match job.idempotency_key.clone() {
                     Some(idempotency_key) => {
                         storage
@@ -288,6 +359,25 @@ impl Worker {
 
             Err(error) => {
                 println!("Worker {worker_id}: job execution failed: {error}");
+
+                // Mark the SAME attempt as failed.
+                storage
+                    .finish_job_attempt(
+                        job.id.clone(),
+                        attempt_number,
+                        JobAttemptStatus::Failed,
+                        Some(error.clone()),
+                    )
+                    .await?;
+
+                println!(
+                    "Worker {worker_id}: attempt {} marked Failed",
+                    attempt_number
+                );
+
+                // ----------------------------------------------------
+                // 10. Decide whether to retry the job.
+                // ----------------------------------------------------
 
                 if job.attempts_made >= job.max_attempts {
                     println!("Worker {worker_id}: maximum attempts reached");
@@ -357,6 +447,21 @@ impl Worker {
     }
 }
 
+// ------------------------------------------------------------
+// Timestamp helper
+// ------------------------------------------------------------
+
+fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before UNIX epoch")
+        .as_millis() as u64
+}
+
+// ------------------------------------------------------------
+// Recovery worker
+// ------------------------------------------------------------
+
 pub async fn run_recovery() -> redis::RedisResult<()> {
     let mut storage = RedisStorage::new().await?;
 
@@ -370,6 +475,10 @@ pub async fn run_recovery() -> redis::RedisResult<()> {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }
+
+// ------------------------------------------------------------
+// Repeatable job scheduler
+// ------------------------------------------------------------
 
 pub async fn run_repeatable_scheduler() -> redis::RedisResult<()> {
     let mut storage = RedisStorage::new().await?;

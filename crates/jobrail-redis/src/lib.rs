@@ -1,4 +1,4 @@
-use jobrail_core::job::{Job, JobId, JobState};
+use jobrail_core::job::{Job, JobAttempt, JobAttemptStatus, JobId, JobState};
 use jobrail_core::{job::JobOptions, repeat::RepeatableJob};
 use redis::{AsyncCommands, Script};
 use serde::{Deserialize, Serialize};
@@ -112,74 +112,110 @@ impl RedisStorage {
         &mut self,
         limit: usize,
         cursor: Option<String>,
+        state: Option<JobState>,
     ) -> redis::RedisResult<JobPage> {
         let limit = limit.clamp(1, 100);
 
-        // Fetch one extra item so we can determine whether another page exists.
+        // Fetch extra records so we can determine whether another page exists.
         let fetch_limit = limit + 1;
 
-        let entries: Vec<(String, f64)> = match cursor {
-            None => {
-                redis::cmd("ZREVRANGE")
-                    .arg("jobrail:jobs:index")
-                    .arg(0)
-                    .arg(fetch_limit - 1)
-                    .arg("WITHSCORES")
-                    .query_async::<Vec<(String, f64)>>(&mut self.connection)
-                    .await?
-            }
+        let mut cursor_state = match cursor {
+            Some(cursor) => Some(decode_cursor(&cursor)?),
+            None => None,
+        };
 
-            Some(cursor) => {
-                let (cursor_score, cursor_member) = decode_cursor(&cursor)?;
+        let mut entries: Vec<(String, f64)> = Vec::new();
 
-                // Redis sorts members with the same score lexicographically.
-                // ZREVRANGE/ZREVRANGEBYSCORE therefore gives us:
-                //
-                // score DESC
-                // member DESC when scores are equal.
-                //
-                // First get all jobs having exactly the cursor score.
-                let mut same_score_members: Vec<String> = redis::cmd("ZRANGEBYSCORE")
-                    .arg("jobrail:jobs:index")
-                    .arg(cursor_score)
-                    .arg(cursor_score)
-                    .query_async::<Vec<String>>(&mut self.connection)
-                    .await?;
+        while entries.len() < fetch_limit {
+            let remaining = fetch_limit - entries.len();
 
-                // ZRANGEBYSCORE returns same-score members in ascending
-                // lexicographical order. Reverse it to match ZREVRANGE order.
-                same_score_members.reverse();
-
-                // Only keep members AFTER the cursor.
-                same_score_members.retain(|member| member < &cursor_member);
-
-                let mut entries: Vec<(String, f64)> = same_score_members
-                    .into_iter()
-                    .take(fetch_limit)
-                    .map(|member| (member, cursor_score))
-                    .collect();
-
-                // If we still need more jobs, get jobs with a LOWER score.
-                if entries.len() < fetch_limit {
-                    let remaining = fetch_limit - entries.len();
-
-                    let lower_score_entries: Vec<(String, f64)> = redis::cmd("ZREVRANGEBYSCORE")
+            let batch: Vec<(String, f64)> = match cursor_state {
+                None => {
+                    redis::cmd("ZREVRANGE")
                         .arg("jobrail:jobs:index")
-                        .arg(format!("({cursor_score}"))
-                        .arg("-inf")
-                        .arg("WITHSCORES")
-                        .arg("LIMIT")
                         .arg(0)
-                        .arg(remaining)
+                        .arg(remaining - 1)
+                        .arg("WITHSCORES")
                         .query_async::<Vec<(String, f64)>>(&mut self.connection)
-                        .await?;
-
-                    entries.extend(lower_score_entries);
+                        .await?
                 }
 
-                entries
+                Some((cursor_score, ref cursor_member)) => {
+                    let mut same_score_members: Vec<String> = redis::cmd("ZRANGEBYSCORE")
+                        .arg("jobrail:jobs:index")
+                        .arg(cursor_score)
+                        .arg(cursor_score)
+                        .query_async::<Vec<String>>(&mut self.connection)
+                        .await?;
+
+                    same_score_members.reverse();
+
+                    same_score_members.retain(|member| member < cursor_member);
+
+                    let mut result: Vec<(String, f64)> = same_score_members
+                        .into_iter()
+                        .take(remaining)
+                        .map(|member| (member, cursor_score))
+                        .collect();
+
+                    if result.len() < remaining {
+                        let still_needed = remaining - result.len();
+
+                        let lower_score_entries: Vec<(String, f64)> =
+                            redis::cmd("ZREVRANGEBYSCORE")
+                                .arg("jobrail:jobs:index")
+                                .arg(format!("({cursor_score}"))
+                                .arg("-inf")
+                                .arg("WITHSCORES")
+                                .arg("LIMIT")
+                                .arg(0)
+                                .arg(still_needed)
+                                .query_async::<Vec<(String, f64)>>(&mut self.connection)
+                                .await?;
+
+                        result.extend(lower_score_entries);
+                    }
+
+                    result
+                }
+            };
+
+            if batch.is_empty() {
+                break;
             }
-        };
+
+            for entry in &batch {
+                let (job_id, score) = entry;
+
+                let uuid = job_id.parse::<uuid::Uuid>().map_err(|err| {
+                    redis::RedisError::from((
+                        redis::ErrorKind::UnexpectedReturnType,
+                        "invalid job id in job index",
+                        err.to_string(),
+                    ))
+                })?;
+
+                let job_id = JobId(uuid);
+
+                if let Some(job) = self.get_job(job_id.clone()).await? {
+                    if state.is_none() || state == Some(job.state) {
+                        entries.push((job_id.0.to_string(), *score));
+                    }
+                }
+
+                if entries.len() >= fetch_limit {
+                    break;
+                }
+            }
+
+            if let Some(last) = batch.last() {
+                cursor_state = Some((last.1, last.0.clone()));
+            }
+
+            if batch.len() < remaining {
+                break;
+            }
+        }
 
         let has_more = entries.len() > limit;
 
@@ -199,7 +235,9 @@ impl RedisStorage {
             let job_id = JobId(uuid);
 
             if let Some(job) = self.get_job(job_id).await? {
-                jobs.push(job);
+                if state.is_none() || state == Some(job.state) {
+                    jobs.push(job);
+                }
             }
         }
 
@@ -217,7 +255,6 @@ impl RedisStorage {
             has_more,
         })
     }
-
     pub async fn enqueue(&mut self, job_id: JobId) -> redis::RedisResult<()> {
         let _: () = self
             .connection
@@ -1058,6 +1095,191 @@ impl RedisStorage {
 
         Ok(deleted == 1)
     }
+
+    pub async fn add_job_attempt(
+        &mut self,
+        job_id: JobId,
+        attempt: &JobAttempt,
+    ) -> redis::RedisResult<()> {
+        let key = format!("jobrail:job:{}:attempts", job_id.0);
+
+        let data = serde_json::to_string(attempt).map_err(|error| {
+            redis::RedisError::from((
+                redis::ErrorKind::UnexpectedReturnType,
+                "failed to serialize job attempt",
+                error.to_string(),
+            ))
+        })?;
+
+        let _: () = self.connection.rpush(key, data).await?;
+
+        Ok(())
+    }
+
+    // pub async fn get_job_attempts(&mut self, job_id: JobId) -> redis::RedisResult<Vec<JobAttempt>> {
+    //     let key = format!("jobrail:job:{}:attempts", job_id.0);
+
+    //     let values: Vec<String> = self.connection.lrange(key, 0, -1).await?;
+
+    //     values
+    //         .into_iter()
+    //         .map(|value| {
+    //             serde_json::from_str(&value).map_err(|error| {
+    //                 redis::RedisError::from((
+    //                     redis::ErrorKind::UnexpectedReturnType,
+    //                     "failed to deserialize job attempt",
+    //                     error.to_string(),
+    //                 ))
+    //             })
+    //         })
+    //         .collect()
+    // }
+
+    pub async fn cancel_job(&mut self, job_id: JobId) -> redis::RedisResult<Option<Job>> {
+        let Some(mut job) = self.get_job(job_id).await? else {
+            return Ok(None);
+        };
+
+        match job.state {
+            JobState::Waiting
+            | JobState::Prioritized
+            | JobState::Delayed
+            | JobState::Scheduled
+            | JobState::Active => {}
+
+            JobState::Completed | JobState::Failed | JobState::Cancelled => {
+                return Ok(Some(job));
+            }
+        }
+
+        let job_id_string = job.id.0.to_string();
+
+        let _: () = redis::pipe()
+            .atomic()
+            .lrem("jobrail:queue:waiting", 0, &job_id_string)
+            .lrem("jobrail:queue:active", 0, &job_id_string)
+            .zrem("jobrail:queue:delayed", &job_id_string)
+            .zrem("jobrail:queue:scheduled", &job_id_string)
+            .query_async(&mut self.connection)
+            .await?;
+
+        job.state = JobState::Cancelled;
+
+        self.save_job(&job).await?;
+
+        Ok(Some(job))
+    }
+
+    pub async fn retry_job(&mut self, job_id: JobId) -> redis::RedisResult<Option<Job>> {
+        let Some(mut job) = self.get_job(job_id).await? else {
+            return Ok(None);
+        };
+
+        if job.state != JobState::Failed {
+            return Ok(Some(job));
+        }
+
+        job.state = if job.priority > 0 {
+            JobState::Prioritized
+        } else {
+            JobState::Waiting
+        };
+
+        job.run_at = None;
+
+        self.save_job(&job).await?;
+        self.enqueue(job.id.clone()).await?;
+
+        Ok(Some(job))
+    }
+    pub async fn start_job_attempt(
+        &mut self,
+        job_id: JobId,
+        attempt: &JobAttempt,
+    ) -> redis::RedisResult<()> {
+        let key = format!("jobrail:job:{}:attempt:{}", job_id.0, attempt.attempt);
+
+        let data = serde_json::to_string(attempt).map_err(|err| {
+            redis::RedisError::from((
+                redis::ErrorKind::UnexpectedReturnType,
+                "failed to serialize job attempt",
+                err.to_string(),
+            ))
+        })?;
+
+        let _: () = self.connection.set(key, data).await?;
+
+        Ok(())
+    }
+
+    pub async fn finish_job_attempt(
+        &mut self,
+        job_id: JobId,
+        attempt_number: u32,
+        status: JobAttemptStatus,
+        error: Option<String>,
+    ) -> redis::RedisResult<()> {
+        let key = format!("jobrail:job:{}:attempt:{}", job_id.0, attempt_number);
+
+        let Some(data): Option<String> = self.connection.get(&key).await? else {
+            return Err(redis::RedisError::from((
+                redis::ErrorKind::UnexpectedReturnType,
+                "job attempt not found",
+            )));
+        };
+
+        let mut attempt: JobAttempt = serde_json::from_str(&data).map_err(|err| {
+            redis::RedisError::from((
+                redis::ErrorKind::UnexpectedReturnType,
+                "failed to deserialize job attempt",
+                err.to_string(),
+            ))
+        })?;
+
+        attempt.finished_at = Some(current_timestamp_ms());
+        attempt.status = status;
+        attempt.error = error;
+
+        let updated_data = serde_json::to_string(&attempt).map_err(|err| {
+            redis::RedisError::from((
+                redis::ErrorKind::UnexpectedReturnType,
+                "failed to serialize job attempt",
+                err.to_string(),
+            ))
+        })?;
+
+        let _: () = self.connection.set(&key, updated_data).await?;
+
+        Ok(())
+    }
+
+    pub async fn get_job_attempts(&mut self, job_id: JobId) -> redis::RedisResult<Vec<JobAttempt>> {
+        let Some(job) = self.get_job(job_id.clone()).await? else {
+            return Ok(Vec::new());
+        };
+
+        let mut attempts = Vec::new();
+
+        for attempt_number in 1..=job.attempts_started {
+            let key = format!("jobrail:job:{}:attempt:{}", job_id.0, attempt_number);
+
+            let Some(data): Option<String> = self.connection.get(&key).await? else {
+                continue;
+            };
+
+            let attempt: JobAttempt = serde_json::from_str(&data).map_err(|err| {
+                redis::RedisError::from((
+                    redis::ErrorKind::UnexpectedReturnType,
+                    "failed to deserialize job attempt",
+                    err.to_string(),
+                ))
+            })?;
+
+            attempts.push(attempt);
+        }
+
+        Ok(attempts)
+    }
 }
 
 fn encode_cursor(score: f64, member: &str) -> String {
@@ -1088,4 +1310,11 @@ fn decode_cursor(cursor: &str) -> redis::RedisResult<(f64, String)> {
     }
 
     Ok((score, member.to_string()))
+}
+
+fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before UNIX epoch")
+        .as_millis() as u64
 }
