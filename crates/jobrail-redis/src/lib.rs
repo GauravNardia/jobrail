@@ -36,6 +36,15 @@ pub struct JobPage {
     pub has_more: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct QueueStats {
+    pub waiting: u64,
+    pub active: u64,
+    pub delayed: u64,
+    pub scheduled: u64,
+    pub processing: u64,
+}
+
 #[derive(Clone)]
 pub struct RedisStorage {
     connection: redis::aio::MultiplexedConnection,
@@ -53,6 +62,38 @@ impl RedisStorage {
 
         Ok(Self { connection })
     }
+
+    pub async fn ping(&mut self) -> redis::RedisResult<()> {
+        let _: String = redis::cmd("PING").query_async(&mut self.connection).await?;
+
+        Ok(())
+    }
+
+    pub async fn queue_stat(&mut self) -> redis::RedisResult<QueueStats> {
+        let (waiting, active, delayed, scheduled, processing): (i64, i64, i64, i64, i64) =
+            redis::pipe()
+                .cmd("LLEN")
+                .arg("jobrail:queue:waiting")
+                .cmd("LLEN")
+                .arg("jobrail:queue:active")
+                .cmd("ZCARD")
+                .arg("jobrail:queue:delayed")
+                .cmd("ZCARD")
+                .arg("jobrail:queue:scheduled")
+                .cmd("ZCARD")
+                .arg("jobrail:queue:processing")
+                .query_async(&mut self.connection)
+                .await?;
+
+        Ok(QueueStats {
+            waiting: waiting.max(0) as u64,
+            active: active.max(0) as u64,
+            delayed: delayed.max(0) as u64,
+            scheduled: scheduled.max(0) as u64,
+            processing: processing.max(0) as u64,
+        })
+    }
+
     pub async fn save_job(&mut self, job: &Job) -> redis::RedisResult<()> {
         let job_key = format!("jobrail:job:{}", job.id.0);
 
