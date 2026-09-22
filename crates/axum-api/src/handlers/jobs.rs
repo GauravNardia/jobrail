@@ -39,16 +39,43 @@ pub async fn create_job(
         idempotency_key: request.idempotency_key,
     };
 
+    if request.max_attempts == 0 {
+        return Err(ApiError::BadRequest(
+            "maxAttempts must be greater than 0".to_string(),
+        ));
+    }
+
     let job = Job::new(request.name, request.payload, options);
 
     let mut storage = state.storage.lock().await;
 
+    /*
+     * A scheduled job belongs in the scheduled sorted set.
+     */
     if job.run_at.is_some() {
         storage
             .schedule_job(job.clone())
             .await
             .map_err(|error| ApiError::Internal(error.to_string()))?;
-    } else {
+    }
+    /*
+     * A delayed job belongs in the delayed sorted set.
+     */
+    else if job.delay_ms > 0 {
+        storage
+            .save_job(&job)
+            .await
+            .map_err(|error| ApiError::Internal(error.to_string()))?;
+
+        storage
+            .schedule_retry(job.id.clone(), job.delay_ms)
+            .await
+            .map_err(|error| ApiError::Internal(error.to_string()))?;
+    }
+    /*
+     * Normal jobs go directly into the waiting queue.
+     */
+    else {
         storage
             .save_job(&job)
             .await
