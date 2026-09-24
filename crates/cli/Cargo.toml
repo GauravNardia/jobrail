@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+dotenvy = "0.15.7"
 jobrail-core = { path = "../core" }
 jobrail-redis = { path = "../jobrail-redis" }
 jobrail-worker = { path = "../worker" }

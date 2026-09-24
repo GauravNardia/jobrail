@@ -15,6 +15,8 @@ impl JobHandler for SendEmailHandler {
 
 #[tokio::main]
 async fn main() -> redis::RedisResult<()> {
+    dotenvy::dotenv().ok();
+
     let worker = Worker::new(1).await?;
 
     let handler = Arc::new(SendEmailHandler);

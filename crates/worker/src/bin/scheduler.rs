@@ -2,6 +2,8 @@ use jobrail_redis::RedisStorage;
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok();
+
     let mut storage = RedisStorage::new()
         .await
         .expect("failed to connect to Redis");

@@ -52,7 +52,10 @@ pub struct RedisStorage {
 
 impl RedisStorage {
     pub async fn new() -> redis::RedisResult<Self> {
-        let client = redis::Client::open("redis://127.0.0.1/")?;
+        let redis_url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+
+        let client = redis::Client::open(redis_url)?;
 
         let config = redis::AsyncConnectionConfig::new().set_response_timeout(None);
 

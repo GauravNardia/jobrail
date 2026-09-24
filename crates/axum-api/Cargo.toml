@@ -16,3 +16,4 @@ redis = { version = "1.7.0", features = ["tokio-comp"] }
 tower = "0.5.3"
 http-body-util = "0.1.5"
 serial_test = "4.0.1"
+dotenvy = "0.15.7"
