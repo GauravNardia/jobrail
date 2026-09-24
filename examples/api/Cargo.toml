@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+jobrail-core = { path = "../../crates/core" }
+jobrail-redis = { path = "../../crates/jobrail-redis" }
+
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
