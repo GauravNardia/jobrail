@@ -759,3 +759,69 @@ cargo check --workspace
 cargo test --workspace
 cargo fmt --all -- --check
 ```
+
+## Running with Docker
+
+The easiest way to run JobRail locally is with Docker Compose.
+
+### Prerequisites
+
+- Docker
+- Docker Compose
+
+### Start JobRail
+
+```bash
+git clone <repository-url>
+cd jobrail
+
+cp .env.example .env
+
+docker compose up --build
+```
+
+# This starts:
+
+- Redis
+- JobRail API
+- Worker
+- Scheduled job scheduler
+- Repeatable job scheduler
+
+## The API is available at:
+
+```bash
+http://localhost:3001
+```
+
+## Stop JobRail
+
+```bash
+docker compose down
+```
+
+## View logs
+
+```bash
+docker compose logs -f
+```
+
+## Or for a specific service:
+
+```bash
+docker compose logs -f api
+docker compose logs -f worker
+docker compose logs -f redis
+```
+
+## Verify Redis
+
+```bash
+docker compose exec redis redis-cli ping
+```
+
+## Expected:
+
+```bash
+PONG
+```
