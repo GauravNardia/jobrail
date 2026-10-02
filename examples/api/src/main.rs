@@ -9,7 +9,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "send-email".to_string(),
         serde_json::json!({
             "to": "user@example.com",
-            "subject": "Hello from JobRail"
+            "subject": "Hello from JobRail",
+            "body": "This email was processed by a JobRail worker."
         }),
         JobOptions::default(),
     );
@@ -18,6 +19,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     storage.enqueue(job.id.clone()).await?;
 
     println!("Created job: {}", job.id.0);
+    println!("Job name: {}", job.name);
+    println!("Job payload: {}", job.payload);
+    println!("Job queued successfully.");
 
     Ok(())
 }
