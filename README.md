@@ -239,6 +239,7 @@ The worker connects to Redis and waits for jobs to execute.
 
 ## Run the Scheduled Job Scheduler
 
+s
 For scheduled jobs:
 
 ```bash
@@ -256,6 +257,145 @@ cargo run -p jobrail-worker --bin repeatable_scheduler
 ```
 
 ---
+
+## End-to-End Example
+
+JobRail separates **job producers** from **job workers**.
+
+A producer creates a job and puts it into the queue. A worker claims the job and passes its payload to your `JobHandler`.
+
+### 1. Start Redis
+
+```bash
+docker compose up -d redis
+```
+
+### 2. Start the example worker
+
+In one terminal:
+
+```bash
+cargo run -p worker-example
+```
+
+The worker will start and wait for jobs:
+
+```text
+Starting JobRail example worker...
+Handler: SendEmailHandler
+Concurrency: 1
+
+Starting worker pool with 1 workers
+Worker 1 started
+```
+
+### 3. Create a job
+
+In another terminal:
+
+```bash
+cargo run -p api
+```
+
+The example producer creates a `send-email` job and puts it into the JobRail queue.
+
+You should see:
+
+```text
+Created job: <job-id>
+Job name: send-email
+Job queued successfully.
+```
+
+The worker will then process it:
+
+```text
+Worker 1 claimed job: <job-id>
+
+JobHandler: SendEmailHandler
+
+To:      user@example.com
+Subject: Hello from JobRail
+Body:    This email was processed by a JobRail worker.
+
+Pretending to send email...
+Email sent successfully!
+
+Worker 1: job executed successfully
+Worker 1: attempt 1 marked Completed
+Worker 1: job completed successfully
+Worker 1: job state after: Completed
+```
+
+### How it works
+
+```text
+Producer
+   │
+   │ create job
+   ▼
+Redis
+   │
+   │ worker claims job
+   ▼
+JobRail Worker
+   │
+   │ payload
+   ▼
+JobHandler
+   │
+   ▼
+Completed
+```
+
+The producer is responsible for creating jobs. The worker is responsible for executing them.
+
+Your application-specific logic lives inside a `JobHandler`:
+
+```rust
+struct SendEmailHandler;
+
+impl JobHandler for SendEmailHandler {
+    fn execute(&self, payload: Value) -> Result<(), String> {
+        // Your application logic
+        Ok(())
+    }
+}
+```
+
+JobRail handles the queue infrastructure — job claiming, attempts, retries, leases, and completion — while your handler contains the actual work.
+
+The complete example is available in:
+
+```text
+jobrail/
+├── Cargo.toml
+│
+├── crates/
+│   ├── core/
+│   │   └── Job models and domain logic
+│   │
+│   ├── jobrail-redis/
+│   │   └── Redis storage and queue operations
+│   │
+│   ├── worker/
+│   │   └── Background workers and schedulers
+│   │
+│   ├── axum-api/
+│   │   └── HTTP API
+│   │
+│   └── cli/
+│       └── CLI utilities
+│
+├── examples/
+│   ├── api/
+│   │   └── Example job producer
+│   │
+│   └── worker/
+│       └── Example JobHandler and worker
+│
+└── README.md
+```
 
 ## Local Development Setup
 
@@ -675,6 +815,10 @@ development**.
 - Axum API
 - TypeScript SDK
 - API integration tests
+- Docker
+- Docker Compose
+- Example producer
+- Example worker
 
 > **Deployment:** JobRail has not been deployed yet and currently runs
 > locally / self-hosted.
@@ -719,9 +863,9 @@ Feature Status
 - Axum API ✅
 - API integration tests ✅
 - TypeScript SDK ✅
-- Documentation 🚧
-- Examples 🚧
-- CI ⏳
+- Documentation ✅
+- Examples ✅
+- CI ✅
 - Production deployment ⏳
 
 ## JobRail Cloud

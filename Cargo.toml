@@ -6,6 +6,7 @@ members = [
     "crates/jobrail-redis",
     "crates/worker",
     "examples/api",
+    "examples/worker",
 ]
 
 resolver = "3"
