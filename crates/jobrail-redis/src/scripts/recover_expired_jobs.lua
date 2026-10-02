@@ -1,13 +1,15 @@
 local now = ARGV[1]
 
-local lease_members = redis.call(
+local expired_members = redis.call(
     "ZRANGEBYSCORE",
     KEYS[1],
     "-inf",
     now
 )
 
-for _, lease_member in ipairs(lease_members) do
+for _, lease_member in ipairs(expired_members) do
+    -- Lease members are:
+    -- <job_id>:<lease_token>
     local separator = string.find(lease_member, ":")
 
     if separator then
@@ -23,27 +25,77 @@ for _, lease_member in ipairs(lease_members) do
         if job_data then
             local job = cjson.decode(job_data)
 
-            job.state = "Waiting"
+            -- Recover the job only if it is still Active.
+            --
+            -- This protects us from accidentally requeueing a job
+            -- that was already completed/cancelled by another owner.
+            if job.state == "Active" then
+                job.state = "Waiting"
 
+                redis.call(
+                    "SET",
+                    job_key,
+                    cjson.encode(job)
+                )
+
+                redis.call(
+                    "LPUSH",
+                    KEYS[2],
+                    job_id
+                )
+            end
+
+            -- If the job has an idempotency key, clear ONLY a
+            -- Processing record belonging to this recovered job.
+            --
+            -- Completed idempotency records must remain.
+local idempotency_key = job.idempotency_key
+
+-- cjson.null is returned by Redis Lua when the JSON field
+-- exists but its value is null.
+--
+-- Only attempt idempotency recovery when the job actually
+-- has an idempotency key.
+if idempotency_key ~= nil
+    and idempotency_key ~= cjson.null
+then
+    local idempotency_redis_key =
+        "jobrail:idempotency:" .. tostring(idempotency_key)
+
+    local idempotency_data = redis.call(
+        "GET",
+        idempotency_redis_key
+    )
+
+    if idempotency_data then
+        local idempotency_record =
+            cjson.decode(idempotency_data)
+
+        local record_job_id =
+            idempotency_record.job_id
+
+        local record_status =
+            idempotency_record.status
+
+        if record_job_id == job_id
+            and record_status == "Processing"
+        then
             redis.call(
-                "SET",
-                job_key,
-                cjson.encode(job)
+                "DEL",
+                idempotency_redis_key
             )
         end
+    end
+end
+        end
 
+        -- Always remove the expired lease.
         redis.call(
             "ZREM",
             KEYS[1],
             lease_member
         )
-
-        redis.call(
-            "LPUSH",
-            KEYS[2],
-            job_id
-        )
     end
 end
 
-return lease_members
+return expired_members
