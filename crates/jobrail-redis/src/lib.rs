@@ -1169,38 +1169,41 @@ impl RedisStorage {
     // }
 
     pub async fn cancel_job(&mut self, job_id: JobId) -> redis::RedisResult<Option<Job>> {
-        let Some(mut job) = self.get_job(job_id).await? else {
-            return Ok(None);
-        };
+        let job_key = format!("jobrail:job:{}", job_id.0);
+        let job_id_string = job_id.0.to_string();
 
-        match job.state {
-            JobState::Waiting
-            | JobState::Prioritized
-            | JobState::Delayed
-            | JobState::Scheduled
-            | JobState::Active => {}
+        let script = Script::new(include_str!("scripts/cancel_job.lua"));
 
-            JobState::Completed | JobState::Failed | JobState::Cancelled => {
-                return Ok(Some(job));
-            }
-        }
-
-        let job_id_string = job.id.0.to_string();
-
-        let _: () = redis::pipe()
-            .atomic()
-            .lrem("jobrail:queue:waiting", 0, &job_id_string)
-            .lrem("jobrail:queue:active", 0, &job_id_string)
-            .zrem("jobrail:queue:delayed", &job_id_string)
-            .zrem("jobrail:queue:scheduled", &job_id_string)
-            .query_async(&mut self.connection)
+        let result: i32 = script
+            // KEYS[1] = job
+            .key(job_key)
+            // KEYS[2] = waiting queue
+            .key("jobrail:queue:waiting")
+            // KEYS[3] = active queue
+            .key("jobrail:queue:active")
+            // KEYS[4] = delayed queue
+            .key("jobrail:queue:delayed")
+            // KEYS[5] = scheduled queue
+            .key("jobrail:queue:scheduled")
+            // KEYS[6] = processing leases
+            .key("jobrail:queue:processing")
+            // ARGV[1] = job id
+            .arg(&job_id_string)
+            .invoke_async(&mut self.connection)
             .await?;
 
-        job.state = JobState::Cancelled;
+        match result {
+            // Job does not exist.
+            0 => Ok(None),
 
-        self.save_job(&job).await?;
+            // Job was cancelled OR was already terminal.
+            1 | 2 => self.get_job(job_id).await,
 
-        Ok(Some(job))
+            _ => Err(redis::RedisError::from((
+                redis::ErrorKind::UnexpectedReturnType,
+                "unexpected cancel_job result",
+            ))),
+        }
     }
 
     pub async fn retry_job(&mut self, job_id: JobId) -> redis::RedisResult<Option<Job>> {
