@@ -8,7 +8,6 @@ local job_ids = redis.call(
 )
 
 for _, job_id in ipairs(job_ids) do
-
     local job_key = "jobrail:job:" .. job_id
 
     local job_data = redis.call(
@@ -34,11 +33,18 @@ for _, job_id in ipairs(job_ids) do
                 job_id
             )
 
-            redis.call(
-                "LPUSH",
+            -- Only add the job if it is not already waiting.
+            if not redis.call(
+                "LPOS",
                 KEYS[2],
                 job_id
-            )
+            ) then
+                redis.call(
+                    "LPUSH",
+                    KEYS[2],
+                    job_id
+                )
+            end
         else
             -- The job is no longer scheduled.
             -- Remove stale scheduled entry.

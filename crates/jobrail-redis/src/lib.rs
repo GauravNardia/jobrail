@@ -300,9 +300,12 @@ impl RedisStorage {
         })
     }
     pub async fn enqueue(&mut self, job_id: JobId) -> redis::RedisResult<()> {
-        let _: () = self
-            .connection
-            .lpush("jobrail:queue:waiting", job_id.0.to_string())
+        let script = Script::new(include_str!("scripts/enqueue_job.lua"));
+
+        let _: i32 = script
+            .key("jobrail:queue:waiting")
+            .arg(job_id.0.to_string())
+            .invoke_async(&mut self.connection)
             .await?;
 
         Ok(())
@@ -1090,30 +1093,21 @@ impl RedisStorage {
         &mut self,
         id: jobrail_core::repeat::RepeatableJobId,
     ) -> redis::RedisResult<bool> {
-        let Some(mut job) = self.get_repeatable_job(id).await? else {
-            return Ok(false);
-        };
-
-        job.enabled = false;
-
         let key = format!("jobrail:repeat:{}", id.0);
 
-        let data = serde_json::to_string(&job).map_err(|error| {
-            redis::RedisError::from((
-                redis::ErrorKind::UnexpectedReturnType,
-                "failed to serialize repeatable job",
-                error.to_string(),
-            ))
-        })?;
+        let script = Script::new(include_str!("scripts/disable_repeatable_job.lua"));
 
-        let _: () = self.connection.set(&key, data).await?;
-
-        let _: () = self
-            .connection
-            .zrem("jobrail:queue:repeatable:schedule", id.0.to_string())
+        let result: i32 = script
+            // KEYS[1] = repeatable job
+            .key(key)
+            // KEYS[2] = repeatable schedule
+            .key("jobrail:queue:repeatable:schedule")
+            // ARGV[1] = repeatable job id
+            .arg(id.0.to_string())
+            .invoke_async(&mut self.connection)
             .await?;
 
-        Ok(true)
+        Ok(result == 1)
     }
 
     pub async fn delete_repeatable_job(
@@ -1122,16 +1116,18 @@ impl RedisStorage {
     ) -> redis::RedisResult<bool> {
         let key = format!("jobrail:repeat:{}", id.0);
 
-        let deleted: i32 = self.connection.del(&key).await?;
+        let script = Script::new(include_str!("scripts/delete_repeatable_job.lua"));
 
-        let _: () = self
-            .connection
-            .srem("jobrail:queue:repeatable", id.0.to_string())
-            .await?;
-
-        let _: () = self
-            .connection
-            .zrem("jobrail:queue:repeatable:schedule", id.0.to_string())
+        let deleted: i32 = script
+            // KEYS[1] = repeatable job
+            .key(key)
+            // KEYS[2] = repeatable set
+            .key("jobrail:queue:repeatable")
+            // KEYS[3] = repeatable schedule
+            .key("jobrail:queue:repeatable:schedule")
+            // ARGV[1] = repeatable job id
+            .arg(id.0.to_string())
+            .invoke_async(&mut self.connection)
             .await?;
 
         Ok(deleted == 1)
@@ -1215,27 +1211,30 @@ impl RedisStorage {
     }
 
     pub async fn retry_job(&mut self, job_id: JobId) -> redis::RedisResult<Option<Job>> {
-        let Some(mut job) = self.get_job(job_id).await? else {
-            return Ok(None);
-        };
+        let job_key = format!("jobrail:job:{}", job_id.0);
 
-        if job.state != JobState::Failed {
-            return Ok(Some(job));
+        let script = Script::new(include_str!("scripts/retry_job.lua"));
+
+        let result: i32 = script
+            // KEYS[1] = job
+            .key(job_key)
+            // KEYS[2] = waiting queue
+            .key("jobrail:queue:waiting")
+            // ARGV[1] = job id
+            .arg(job_id.0.to_string())
+            .invoke_async(&mut self.connection)
+            .await?;
+
+        match result {
+            0 | 2 => self.get_job(job_id).await,
+            1 => self.get_job(job_id).await,
+            _ => Err(redis::RedisError::from((
+                redis::ErrorKind::UnexpectedReturnType,
+                "unexpected retry_job result",
+            ))),
         }
-
-        job.state = if job.priority > 0 {
-            JobState::Prioritized
-        } else {
-            JobState::Waiting
-        };
-
-        job.run_at = None;
-
-        self.save_job(&job).await?;
-        self.enqueue(job.id.clone()).await?;
-
-        Ok(Some(job))
     }
+
     pub async fn start_job_attempt(
         &mut self,
         job_id: JobId,

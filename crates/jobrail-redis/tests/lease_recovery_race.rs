@@ -1,14 +1,25 @@
 use jobrail_core::job::{Job, JobOptions, JobState};
 use jobrail_redis::RedisStorage;
 use redis::AsyncCommands;
+use serial_test::serial;
 
 #[tokio::test]
+#[serial]
 async fn expired_worker_cannot_complete_after_recovery() -> redis::RedisResult<()> {
     let client = redis::Client::open("redis://127.0.0.1/")?;
 
     let mut connection = client.get_multiplexed_async_connection().await?;
 
     let mut storage = RedisStorage::new().await?;
+
+    let _: () = redis::cmd("DEL")
+        .arg("jobrail:queue:waiting")
+        .arg("jobrail:queue:active")
+        .arg("jobrail:queue:delayed")
+        .arg("jobrail:queue:scheduled")
+        .arg("jobrail:queue:processing")
+        .query_async(&mut connection)
+        .await?;
 
     // ---------------------------------------------------------
     // 1. Create a job
@@ -262,6 +273,201 @@ async fn expired_worker_cannot_complete_after_recovery() -> redis::RedisResult<(
     let _: () = connection
         .zrem("jobrail:queue:processing", &worker_b_member)
         .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn expired_worker_cannot_schedule_retry_after_recovery() -> redis::RedisResult<()> {
+    let client = redis::Client::open("redis://127.0.0.1/")?;
+    let mut connection = client.get_multiplexed_async_connection().await?;
+
+    let mut storage = RedisStorage::new().await?;
+
+    let _: () = redis::cmd("DEL")
+        .arg("jobrail:queue:waiting")
+        .arg("jobrail:queue:active")
+        .arg("jobrail:queue:delayed")
+        .arg("jobrail:queue:scheduled")
+        .arg("jobrail:queue:processing")
+        .query_async(&mut connection)
+        .await?;
+
+    let job = Job::new(
+        "retry-recovery-race".to_string(),
+        serde_json::json!({
+            "test": true
+        }),
+        JobOptions::default(),
+    );
+
+    let job_id = job.id.clone();
+    let job_id_string = job.id.0.to_string();
+
+    storage.save_job(&job).await?;
+    storage.enqueue(job_id.clone()).await?;
+
+    // Worker A claims.
+    let worker_a = storage.wait_and_claim_job(60_000).await?;
+
+    let worker_a_token = worker_a.token.clone();
+    let worker_a_member = format!("{}:{}", job_id.0, worker_a_token);
+
+    let started = storage
+        .start_job(job_id.clone(), worker_a_token.clone())
+        .await?;
+
+    assert!(started);
+
+    // Simulate Worker A crash.
+    let _: usize = connection
+        .zadd("jobrail:queue:processing", &worker_a_member, 0_i64)
+        .await?;
+
+    // Recovery gives ownership back to the queue.
+    storage.recover_expired_jobs().await?;
+
+    let recovered = storage
+        .get_job(job_id.clone())
+        .await?
+        .expect("job should exist");
+
+    assert_eq!(recovered.state, JobState::Waiting);
+
+    // Worker B takes ownership.
+    let worker_b = storage.wait_and_claim_job(60_000).await?;
+
+    let worker_b_token = worker_b.token.clone();
+
+    let started = storage
+        .start_job(job_id.clone(), worker_b_token.clone())
+        .await?;
+
+    assert!(started);
+
+    // Worker A wakes up late and tries to schedule a retry.
+    let stale_retry = storage
+        .fail_job(
+            job_id.clone(),
+            worker_a_token.clone(),
+            JobState::Delayed,
+            123_456_789,
+        )
+        .await?;
+
+    assert!(!stale_retry, "stale Worker A must not schedule a retry");
+
+    let final_job = storage
+        .get_job(job_id.clone())
+        .await?
+        .expect("job should exist");
+
+    assert_eq!(
+        final_job.state,
+        JobState::Active,
+        "Worker B must remain the owner"
+    );
+
+    let delayed_score: Option<f64> = connection
+        .zscore("jobrail:queue:delayed", &job_id_string)
+        .await?;
+
+    assert!(
+        delayed_score.is_none(),
+        "stale Worker A created a delayed retry"
+    );
+
+    storage
+        .complete_job(job_id.clone(), worker_b_token.clone())
+        .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn stale_retry_cannot_override_completed_job() -> redis::RedisResult<()> {
+    let client = redis::Client::open("redis://127.0.0.1/")?;
+    let mut connection = client.get_multiplexed_async_connection().await?;
+
+    let mut storage = RedisStorage::new().await?;
+
+    let _: () = redis::cmd("DEL")
+        .arg("jobrail:queue:waiting")
+        .arg("jobrail:queue:active")
+        .arg("jobrail:queue:delayed")
+        .arg("jobrail:queue:scheduled")
+        .arg("jobrail:queue:processing")
+        .query_async(&mut connection)
+        .await?;
+
+    let job = Job::new(
+        "retry-completion-race".to_string(),
+        serde_json::json!({
+            "test": true
+        }),
+        JobOptions::default(),
+    );
+
+    let job_id = job.id.clone();
+
+    storage.save_job(&job).await?;
+    storage.enqueue(job_id.clone()).await?;
+
+    let worker_a = storage.wait_and_claim_job(60_000).await?;
+    let worker_a_token = worker_a.token.clone();
+
+    assert!(
+        storage
+            .start_job(job_id.clone(), worker_a_token.clone())
+            .await?
+    );
+
+    let worker_a_member = format!("{}:{}", job_id.0, worker_a_token);
+
+    // Expire A.
+    let _: usize = connection
+        .zadd("jobrail:queue:processing", &worker_a_member, 0_i64)
+        .await?;
+
+    storage.recover_expired_jobs().await?;
+
+    // B reclaims.
+    let worker_b = storage.wait_and_claim_job(60_000).await?;
+    let worker_b_token = worker_b.token.clone();
+
+    assert!(
+        storage
+            .start_job(job_id.clone(), worker_b_token.clone())
+            .await?
+    );
+
+    // B completes first.
+    let completed = storage
+        .complete_job(job_id.clone(), worker_b_token.clone())
+        .await?;
+
+    assert!(completed);
+
+    // A wakes up and tries failure/retry.
+    let stale_failure = storage
+        .fail_job(
+            job_id.clone(),
+            worker_a_token.clone(),
+            JobState::Delayed,
+            123_456,
+        )
+        .await?;
+
+    assert!(
+        !stale_failure,
+        "stale Worker A must not retry a completed job"
+    );
+
+    let final_job = storage.get_job(job_id).await?.expect("job should exist");
+
+    assert_eq!(final_job.state, JobState::Completed);
 
     Ok(())
 }

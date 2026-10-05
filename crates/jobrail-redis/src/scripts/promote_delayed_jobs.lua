@@ -8,8 +8,60 @@ local job_ids = redis.call(
 )
 
 for _, job_id in ipairs(job_ids) do
-    redis.call("ZREM", KEYS[1], job_id)
-    redis.call("RPUSH", KEYS[2], job_id)
+    local job_key = "jobrail:job:" .. job_id
+
+    local job_data = redis.call(
+        "GET",
+        job_key
+    )
+
+    if job_data then
+        local job = cjson.decode(job_data)
+
+        if job.state == "Delayed" then
+            job.state = "Waiting"
+
+            redis.call(
+                "SET",
+                job_key,
+                cjson.encode(job)
+            )
+
+            redis.call(
+                "ZREM",
+                KEYS[1],
+                job_id
+            )
+
+            -- Only add the job if it is not already waiting.
+            if not redis.call(
+                "LPOS",
+                KEYS[2],
+                job_id
+            ) then
+                redis.call(
+                    "LPUSH",
+                    KEYS[2],
+                    job_id
+                )
+            end
+        else
+            -- The job is no longer delayed.
+            -- Remove stale delayed entry.
+            redis.call(
+                "ZREM",
+                KEYS[1],
+                job_id
+            )
+        end
+    else
+        -- Job disappeared; remove stale delayed entry.
+        redis.call(
+            "ZREM",
+            KEYS[1],
+            job_id
+        )
+    end
 end
 
 return job_ids

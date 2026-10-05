@@ -3,6 +3,13 @@ use jobrail_redis::RedisStorage;
 use serial_test::serial;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+fn current_timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is before UNIX epoch")
+        .as_millis() as u64
+}
+
 #[tokio::test]
 #[serial]
 async fn scheduled_job_is_promoted_when_due() {
@@ -140,4 +147,41 @@ async fn future_scheduled_job_is_not_promoted_early() {
         .query_async(&mut connection)
         .await
         .expect("failed to clean test data");
+}
+
+#[tokio::test]
+async fn cancelled_scheduled_job_is_not_promoted() -> redis::RedisResult<()> {
+    let mut storage = RedisStorage::new().await?;
+
+    let run_at = current_timestamp_ms() - 1;
+
+    let job = Job::new(
+        "cancelled-scheduled".to_string(),
+        serde_json::json!({
+            "test": true
+        }),
+        JobOptions {
+            run_at: Some(run_at),
+            ..Default::default()
+        },
+    );
+
+    let job_id = job.id.clone();
+
+    storage.schedule_job(job).await?;
+
+    let cancelled = storage.cancel_job(job_id.clone()).await?;
+
+    assert_eq!(
+        cancelled.expect("job should exist").state,
+        JobState::Cancelled
+    );
+
+    storage.promote_scheduled_jobs().await?;
+
+    let final_job = storage.get_job(job_id).await?.expect("job should exist");
+
+    assert_eq!(final_job.state, JobState::Cancelled);
+
+    Ok(())
 }
