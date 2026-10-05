@@ -241,10 +241,10 @@ impl RedisStorage {
 
                 let job_id = JobId(uuid);
 
-                if let Some(job) = self.get_job(job_id.clone()).await? {
-                    if state.is_none() || state == Some(job.state) {
-                        entries.push((job_id.0.to_string(), *score));
-                    }
+                if let Some(job) = self.get_job(job_id.clone()).await?
+                    && (state.is_none() || state == Some(job.state))
+                {
+                    entries.push((job_id.0.to_string(), *score));
                 }
 
                 if entries.len() >= fetch_limit {
@@ -278,10 +278,10 @@ impl RedisStorage {
 
             let job_id = JobId(uuid);
 
-            if let Some(job) = self.get_job(job_id).await? {
-                if state.is_none() || state == Some(job.state) {
-                    jobs.push(job);
-                }
+            if let Some(job) = self.get_job(job_id).await?
+                && (state.is_none() || state == Some(job.state))
+            {
+                jobs.push(job);
             }
         }
 

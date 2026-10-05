@@ -2,29 +2,23 @@ use crate::job::JobState;
 
 impl JobState {
     pub fn can_transition_to(&self, next: JobState) -> bool {
-        match (self, next) {
-            (JobState::Waiting, JobState::Active) => true,
-            (JobState::Prioritized, JobState::Active) => true,
-
-            (JobState::Scheduled, JobState::Waiting) => true,
-
-            (JobState::Delayed, JobState::Waiting) => true,
-
-            (JobState::Active, JobState::Completed) => true,
-            (JobState::Active, JobState::Failed) => true,
-            (JobState::Active, JobState::Delayed) => true,
-            (JobState::Active, JobState::Waiting) => true,
-
-            (JobState::Waiting, JobState::Cancelled) => true,
-            (JobState::Prioritized, JobState::Cancelled) => true,
-            (JobState::Delayed, JobState::Cancelled) => true,
-            (JobState::Scheduled, JobState::Cancelled) => true,
-            (JobState::Active, JobState::Cancelled) => true,
-
-            (JobState::Failed, JobState::Waiting) => true,
-
-            _ => false,
-        }
+        matches!(
+            (self, next),
+            (JobState::Waiting, JobState::Active)
+                | (JobState::Prioritized, JobState::Active)
+                | (JobState::Scheduled, JobState::Waiting)
+                | (JobState::Delayed, JobState::Waiting)
+                | (JobState::Active, JobState::Completed)
+                | (JobState::Active, JobState::Failed)
+                | (JobState::Active, JobState::Delayed)
+                | (JobState::Active, JobState::Waiting)
+                | (JobState::Waiting, JobState::Cancelled)
+                | (JobState::Prioritized, JobState::Cancelled)
+                | (JobState::Delayed, JobState::Cancelled)
+                | (JobState::Scheduled, JobState::Cancelled)
+                | (JobState::Active, JobState::Cancelled)
+                | (JobState::Failed, JobState::Waiting)
+        )
     }
 }
 

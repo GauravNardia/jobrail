@@ -10,6 +10,12 @@ impl JobId {
     }
 }
 
+impl Default for JobId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobAttempt {
     pub attempt: u32,
@@ -115,6 +121,7 @@ impl Job {
                 to: next,
             });
         }
+
         self.state = next;
 
         Ok(())
@@ -128,7 +135,6 @@ impl Job {
 }
 
 #[cfg(test)]
-
 mod tests {
     use super::*;
 
@@ -136,7 +142,7 @@ mod tests {
     fn job_can_transition_to_active() {
         let mut job = Job::new(
             "send_email",
-            serde_json::json!({  "email": "test@example.com" }),
+            serde_json::json!({ "email": "test@example.com" }),
             JobOptions::default(),
         );
 
@@ -150,7 +156,7 @@ mod tests {
     fn job_cannot_transition_from_completed_to_active() {
         let mut job = Job::new(
             "send_email",
-            serde_json::json!({  "email": "test@example.com" }),
+            serde_json::json!({ "email": "test@example.com" }),
             JobOptions::default(),
         );
 
@@ -166,7 +172,7 @@ mod tests {
     fn new_job_starts_waiting() {
         let job = Job::new(
             "send_email",
-            serde_json::json!({  "email": "test@example.com" }),
+            serde_json::json!({ "email": "test@example.com" }),
             JobOptions::default(),
         );
 

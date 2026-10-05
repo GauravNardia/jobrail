@@ -2,6 +2,7 @@ use jobrail_core::job::{JobAttempt, JobAttemptStatus, JobState};
 use jobrail_redis::RedisStorage;
 use serde_json::Value;
 use std::sync::Arc;
+use tokio::sync::watch;
 
 pub trait JobHandler: Send + Sync {
     fn execute(&self, payload: Value) -> Result<(), String>;
@@ -30,35 +31,85 @@ impl Worker {
     {
         println!("Starting worker pool with {} workers", self.concurrency);
 
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let signal_tx = shutdown_tx.clone();
+
+        tokio::spawn(async move {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => {
+                    println!("Shutdown signal received");
+
+                    let _ = signal_tx.send(true);
+                }
+
+                Err(error) => {
+                    eprintln!("Failed to listen for shutdown signal: {error}");
+                }
+            }
+        });
+
         let mut handles = Vec::new();
 
         for worker_id in 1..=self.concurrency {
             let handler = Arc::clone(&handler);
+            let mut shutdown_rx = shutdown_rx.clone();
 
             let handle = tokio::spawn(async move {
                 println!("Worker {worker_id} started");
 
                 let mut storage = match RedisStorage::new().await {
                     Ok(storage) => storage,
+
                     Err(error) => {
                         eprintln!("Worker {worker_id} failed to connect to Redis: {error}");
+
                         return;
                     }
                 };
 
                 loop {
-                    if let Err(error) =
-                        Worker::run_once(worker_id, &mut storage, Arc::clone(&handler)).await
-                    {
-                        eprintln!("Worker {worker_id} failed: {error}");
+                    if *shutdown_rx.borrow() {
+                        println!("Worker {worker_id}: shutdown requested");
+                        break;
+                    }
 
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tokio::select! {
+                        result = Worker::run_once(
+                            worker_id,
+                            &mut storage,
+                            Arc::clone(&handler),
+                        ) => {
+                            if let Err(error) = result {
+                                eprintln!(
+                                    "Worker {worker_id} failed: {error}"
+                                );
+
+                                tokio::time::sleep(
+                                    std::time::Duration::from_secs(1)
+                                ).await;
+                            }
+                        }
+
+                        result = shutdown_rx.changed() => {
+                            if result.is_ok() && *shutdown_rx.borrow() {
+                                println!(
+                                    "Worker {worker_id}: shutdown requested"
+                                );
+
+                                break;
+                            }
+                        }
                     }
                 }
+
+                println!("Worker {worker_id} stopped");
             });
 
             handles.push(handle);
         }
+
+        drop(shutdown_tx);
 
         for handle in handles {
             handle.await.map_err(|error| {
@@ -69,6 +120,8 @@ impl Worker {
                 ))
             })?;
         }
+
+        println!("Worker pool stopped");
 
         Ok(())
     }
@@ -209,8 +262,6 @@ impl Worker {
                     heartbeat_handle.abort();
 
                     if returned_to_waiting {
-                        job.state = JobState::Waiting;
-
                         println!("Worker {worker_id}: duplicate job returned to Waiting");
                     } else {
                         eprintln!(
@@ -234,8 +285,6 @@ impl Worker {
                     heartbeat_handle.abort();
 
                     if completed {
-                        job.state = JobState::Completed;
-
                         println!("Worker {worker_id}: duplicate job marked as Completed");
                     } else {
                         eprintln!(
@@ -278,37 +327,33 @@ impl Worker {
 
         // ------------------------------------------------------------
         // 7. Execute the actual handler.
+        //
+        // spawn_blocking is used because JobHandler::execute is
+        // synchronous and may perform blocking work.
         // ------------------------------------------------------------
 
         let payload = job.payload.clone();
         let handler = Arc::clone(&handler);
 
-        let result = tokio::task::spawn_blocking(move || handler.execute(payload))
-            .await
-            .map_err(|err| {
-                redis::RedisError::from((
-                    redis::ErrorKind::UnexpectedReturnType,
-                    "job handler task panicked",
-                    err.to_string(),
-                ))
-            })?;
+        let result = tokio::task::spawn_blocking(move || handler.execute(payload)).await;
 
-        // ------------------------------------------------------------
-        // 8. Job execution finished.
-        // Heartbeat is no longer needed.
-        // ------------------------------------------------------------
-
+        // The handler has finished.
+        //
+        // We no longer need the heartbeat. The final completion/failure
+        // operation will verify that this worker still owns the lease.
         heartbeat_handle.abort();
 
         // ------------------------------------------------------------
-        // 9. Handle success / failure.
+        // 8. Handle success / failure exactly ONCE.
         // ------------------------------------------------------------
 
         match result {
-            Ok(()) => {
+            // --------------------------------------------------------
+            // Handler succeeded.
+            // --------------------------------------------------------
+            Ok(Ok(())) => {
                 println!("Worker {worker_id}: job executed successfully");
 
-                // Mark the SAME attempt as completed.
                 storage
                     .finish_job_attempt(
                         job.id.clone(),
@@ -323,7 +368,6 @@ impl Worker {
                     attempt_number
                 );
 
-                // Now complete the actual job.
                 let completed = match job.idempotency_key.clone() {
                     Some(idempotency_key) => {
                         storage
@@ -347,9 +391,11 @@ impl Worker {
 
                     println!("Worker {worker_id}: job completed successfully");
                 } else {
-                    // The lease expired or another worker owns
-                    // the job now. We MUST NOT save our local
-                    // job state because we are no longer the owner.
+                    // The lease expired or another worker now owns
+                    // the job.
+                    //
+                    // IMPORTANT:
+                    // Do NOT save our local job state here.
                     eprintln!(
                         "Worker {worker_id}: lost ownership of job {} before completion",
                         job.id.0
@@ -357,10 +403,12 @@ impl Worker {
                 }
             }
 
-            Err(error) => {
+            // --------------------------------------------------------
+            // Handler returned an application error.
+            // --------------------------------------------------------
+            Ok(Err(error)) => {
                 println!("Worker {worker_id}: job execution failed: {error}");
 
-                // Mark the SAME attempt as failed.
                 storage
                     .finish_job_attempt(
                         job.id.clone(),
@@ -376,7 +424,7 @@ impl Worker {
                 );
 
                 // ----------------------------------------------------
-                // 10. Decide whether to retry the job.
+                // Decide whether this job should retry.
                 // ----------------------------------------------------
 
                 if job.attempts_made >= job.max_attempts {
@@ -406,17 +454,109 @@ impl Worker {
 
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .map_err(|err| {
+                        .map_err(|error| {
                             redis::RedisError::from((
                                 redis::ErrorKind::UnexpectedReturnType,
                                 "system clock is before UNIX epoch",
-                                err.to_string(),
+                                error.to_string(),
                             ))
                         })?;
 
                     let retry_at = now.as_millis() as u64 + delay_ms;
 
                     println!("Worker {worker_id}: retrying in {} ms", delay_ms);
+
+                    let delayed = storage
+                        .fail_job(
+                            job.id.clone(),
+                            lease.token.clone(),
+                            JobState::Delayed,
+                            retry_at,
+                        )
+                        .await?;
+
+                    if delayed {
+                        job.state = JobState::Delayed;
+
+                        println!("Worker {worker_id}: job scheduled for retry");
+                    } else {
+                        eprintln!(
+                            "Worker {worker_id}: lost ownership of job {} before scheduling retry",
+                            job.id.0
+                        );
+                    }
+                }
+            }
+
+            // --------------------------------------------------------
+            // Handler task panicked or was cancelled.
+            // --------------------------------------------------------
+            Err(join_error) => {
+                let error = if join_error.is_panic() {
+                    "job handler panicked".to_string()
+                } else if join_error.is_cancelled() {
+                    "job handler task was cancelled".to_string()
+                } else {
+                    join_error.to_string()
+                };
+
+                eprintln!("Worker {worker_id}: handler execution failed abnormally: {error}");
+
+                storage
+                    .finish_job_attempt(
+                        job.id.clone(),
+                        attempt_number,
+                        JobAttemptStatus::Failed,
+                        Some(error.clone()),
+                    )
+                    .await?;
+
+                println!(
+                    "Worker {worker_id}: attempt {} marked Failed",
+                    attempt_number
+                );
+
+                // ----------------------------------------------------
+                // Treat panic/cancellation exactly like a normal
+                // execution failure.
+                // ----------------------------------------------------
+
+                if job.attempts_made >= job.max_attempts {
+                    println!("Worker {worker_id}: maximum attempts reached");
+
+                    let failed = storage
+                        .fail_job(job.id.clone(), lease.token.clone(), JobState::Failed, 0)
+                        .await?;
+
+                    if failed {
+                        job.state = JobState::Failed;
+
+                        println!("Worker {worker_id}: job marked as Failed");
+                    } else {
+                        eprintln!(
+                            "Worker {worker_id}: lost ownership of job {} before marking it Failed",
+                            job.id.0
+                        );
+                    }
+                } else {
+                    let delay_ms = job.retry_delay_ms();
+
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|error| {
+                            redis::RedisError::from((
+                                redis::ErrorKind::UnexpectedReturnType,
+                                "system clock is before UNIX epoch",
+                                error.to_string(),
+                            ))
+                        })?;
+
+                    let retry_at = now.as_millis() as u64 + delay_ms;
+
+                    println!(
+                        "Worker {worker_id}: retrying in {} ms after abnormal failure",
+                        delay_ms
+                    );
 
                     let delayed = storage
                         .fail_job(
@@ -475,6 +615,10 @@ pub async fn run_recovery() -> redis::RedisResult<()> {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }
+
+// ------------------------------------------------------------
+// Scheduled job scheduler
+// ------------------------------------------------------------
 
 pub async fn run_scheduled_scheduler() -> redis::RedisResult<()> {
     let mut storage = RedisStorage::new().await?;

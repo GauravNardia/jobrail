@@ -11,6 +11,12 @@ impl RepeatableJobId {
     }
 }
 
+impl Default for RepeatableJobId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RepeatSchedule {
     EveryMillis(u64),

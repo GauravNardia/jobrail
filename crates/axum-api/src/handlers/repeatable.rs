@@ -84,7 +84,7 @@ pub async fn disable_repeatable_job(
     let mut storage = state.storage.lock().await;
 
     let disabled = storage
-        .disable_repeatable_job(repeatable_job_id.clone())
+        .disable_repeatable_job(repeatable_job_id)
         .await
         .map_err(|error| ApiError::Internal(error.to_string()))?;
 
@@ -116,7 +116,7 @@ pub async fn delete_repeatable_job(
     let mut storage = state.storage.lock().await;
 
     let job = storage
-        .get_repeatable_job(repeatable_job_id.clone())
+        .get_repeatable_job(repeatable_job_id)
         .await
         .map_err(|error| ApiError::Internal(error.to_string()))?;
 
