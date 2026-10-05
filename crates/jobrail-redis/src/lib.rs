@@ -614,26 +614,34 @@ impl RedisStorage {
         retry_at: u64,
     ) -> redis::RedisResult<bool> {
         let lease_member = format!("{}:{}", job_id.0, token);
-
         let job_key = format!("jobrail:job:{}", job_id.0);
 
-        let state = serde_json::to_string(&state).map_err(|err| {
+        let state = serde_json::to_string(&state).map_err(|error| {
             redis::RedisError::from((
                 redis::ErrorKind::UnexpectedReturnType,
                 "failed to serialize job state",
-                err.to_string(),
+                error.to_string(),
             ))
         })?;
 
         let script = Script::new(include_str!("scripts/fail_job.lua"));
 
         let result: i32 = script
+            // KEYS[1] = processing leases
             .key("jobrail:queue:processing")
+            // KEYS[2] = job
             .key(job_key)
+            // KEYS[3] = active queue
             .key("jobrail:queue:active")
+            // KEYS[4] = delayed queue
             .key("jobrail:queue:delayed")
+            // KEYS[5] = waiting queue
+            .key("jobrail:queue:waiting")
+            // ARGV[1] = lease member
             .arg(lease_member)
+            // ARGV[2] = target state
             .arg(state.trim_matches('"'))
+            // ARGV[3] = retry timestamp
             .arg(retry_at)
             .invoke_async(&mut self.connection)
             .await?;
